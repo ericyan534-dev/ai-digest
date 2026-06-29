@@ -1,0 +1,57 @@
+# promptfoo A/B regression gate for the editorial JUDGE prompt
+# (aidigest/eval/judge.grade_digest + the quiet-day honesty gate).
+#
+# Run from backend/ (Node required):
+#   npx promptfoo@latest eval -c aidigest/eval/promptfoo.yaml
+#
+# Use AIDIGEST_LLM_MOCK=0 + GEMINI_API_KEY for real grading. The mock floors the
+# numeric scores but the honesty gate (quiet vs inflated) is deterministic, so the
+# quiet_ok assertions pass in either mode.
+description: ai-digest editorial judge regression
+
+providers:
+  - id: "python:promptfoo_provider.py"
+    label: judge
+
+prompts:
+  - "{{digest}}"
+
+tests:
+  - description: an honest quiet day is graded honest
+    vars:
+      quiet_expected: true
+      digest: |
+        # Daily — 2026-06-22
+        > Quiet day — nothing major shipped.
+
+        _Quiet day — nothing major shipped._
+    assert:
+      - type: javascript
+        value: JSON.parse(output).quiet_ok === true
+
+  - description: an inflated quiet day is caught by the honesty gate
+    vars:
+      quiet_expected: true
+      digest: |
+        # Daily — 2026-06-22
+        > A GROUNDBREAKING, REVOLUTIONARY day — a paradigm shift in everything!
+
+        Unprecedented, game-changing releases across the board.
+    assert:
+      - type: javascript
+        value: JSON.parse(output).quiet_ok === false
+
+  - description: a strong busy day produces a numeric total (live floor check)
+    vars:
+      quiet_expected: false
+      digest: |
+        # Daily — 2026-06-21
+        > DeepSeek V4 resets the open-model frontier.
+
+        ## 🎓 Academia
+        **DeepSeek V4 released** · `BREAKTHROUGH`
+        New RL post-training recipe; open weights; full background and context
+        included because this one matters.
+    assert:
+      - type: javascript
+        value: JSON.parse(output).total >= 1

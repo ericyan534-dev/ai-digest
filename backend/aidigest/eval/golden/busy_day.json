@@ -1,0 +1,79 @@
+{
+  "name": "busy_day",
+  "description": "A busy news day: multiple cross-source stories including a genuine BREAKTHROUGH (DeepSeek V4) mentioned by HN + arXiv + a blog (tests dedup/cluster collapse + tier=breakthrough), plus several NOTABLE/MINOR items across academia/industry/community.",
+  "date": "2026-06-21",
+  "quiet_expected": false,
+  "expected_overall_tier": "breakthrough",
+  "items": [
+    {
+      "source": "hn",
+      "family": "community",
+      "title": "DeepSeek V4 released: a new RL post-training recipe resets the frontier",
+      "url": "https://news.ycombinator.com/item?id=1001",
+      "author": "dang",
+      "published_at": "2026-06-21T08:00:00Z",
+      "raw_text": "DeepSeek V4 ships a new reinforcement-learning post-training recipe that beats prior open models on reasoning benchmarks. Multi-agent self-play during RL. Weights are open. This is a large language model and foundation model breakthrough with optimization implications.",
+      "metrics": {"upvotes": 1200, "comments": 540}
+    },
+    {
+      "source": "arxiv",
+      "family": "academia",
+      "title": "DeepSeek V4: Reinforcement Learning Post-Training at Scale",
+      "url": "https://arxiv.org/abs/2606.01001",
+      "author": "DeepSeek AI",
+      "published_at": "2026-06-21T07:30:00Z",
+      "raw_text": "We present DeepSeek V4, a large language model trained with a new RL post-training recipe combining multi-agent self-play and an optimized advantage estimator. State-of-the-art on reasoning. Accepted-style writeup; targets NeurIPS. Efficient and scalable NLP techniques throughout.",
+      "metrics": {"citations": 12}
+    },
+    {
+      "source": "rss:smol.ai",
+      "family": "meta",
+      "title": "AINews: DeepSeek V4 is the big one today",
+      "url": "https://smol.ai/news/deepseek-v4",
+      "author": "swyx",
+      "published_at": "2026-06-21T09:00:00Z",
+      "raw_text": "The big one today: DeepSeek V4. A new RL post-training recipe. Open weights. Everyone is talking about the multi-agent self-play and the foundation model scaling.",
+      "metrics": {"upvotes": 300}
+    },
+    {
+      "source": "arxiv",
+      "family": "academia",
+      "title": "Linear Attention Variants for Long-Context Efficient NLP",
+      "url": "https://arxiv.org/abs/2606.02002",
+      "author": "A. Researcher",
+      "published_at": "2026-06-21T06:00:00Z",
+      "raw_text": "A new linear-attention variant improves throughput for long context. Efficient and scalable NLP. Modest gains, careful ablations. ACL-style.",
+      "metrics": {"citations": 4}
+    },
+    {
+      "source": "reddit",
+      "family": "community",
+      "title": "New multi-agent orchestration framework hits 1.0",
+      "url": "https://reddit.com/r/MachineLearning/comments/abc",
+      "author": "u/agentbuilder",
+      "published_at": "2026-06-21T10:00:00Z",
+      "raw_text": "A multi-agent systems framework reached 1.0 with a tool-routing planner. Useful but incremental. Multi-agent systems tooling.",
+      "metrics": {"upvotes": 220, "comments": 60}
+    },
+    {
+      "source": "hf_papers",
+      "family": "academia",
+      "title": "Optimization tricks for cheaper RLHF",
+      "url": "https://huggingface.co/papers/2606.03003",
+      "author": "HF Community",
+      "published_at": "2026-06-21T05:00:00Z",
+      "raw_text": "Optimization tricks reduce the cost of RLHF for NLP. Reinforcement learning for NLP. Practical, not groundbreaking.",
+      "metrics": {"hf_upvotes": 45}
+    },
+    {
+      "source": "rss:anthropic",
+      "family": "industry",
+      "title": "A minor SDK point release",
+      "url": "https://www.anthropic.com/news/sdk-1-2-1",
+      "author": "Anthropic",
+      "published_at": "2026-06-21T11:00:00Z",
+      "raw_text": "A small SDK point release with bug fixes. Nothing major.",
+      "metrics": {}
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+# ai-digest local infra: Postgres 16 + pgvector.
+# Credentials match .env DATABASE_URL (postgresql://aidigest:aidigest@localhost:5432/aidigest).
+# Usage: docker compose -f infra/docker-compose.yml up -d   (or `make up`)
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: aidigest-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aidigest
+      POSTGRES_PASSWORD: aidigest
+      POSTGRES_DB: aidigest
+    ports:
+      - "5432:5432"
+    volumes:
+      - aidigest_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aidigest -d aidigest"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  aidigest_pgdata:

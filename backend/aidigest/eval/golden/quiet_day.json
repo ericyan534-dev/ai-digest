@@ -1,0 +1,49 @@
+{
+  "name": "quiet_day",
+  "description": "A quiet news day: nothing major shipped. A few low-signal community/industry items and one incremental paper — no BREAKTHROUGH, no NOTABLE release, no important paper. The digest MUST say so honestly and MUST NOT inflate these into headlines.",
+  "date": "2026-06-22",
+  "quiet_expected": true,
+  "expected_overall_tier": "quiet_day",
+  "items": [
+    {
+      "source": "hn",
+      "family": "community",
+      "title": "Show HN: a small CLI to pretty-print JSON logs",
+      "url": "https://news.ycombinator.com/item?id=2001",
+      "author": "someone",
+      "published_at": "2026-06-22T08:00:00Z",
+      "raw_text": "A small command-line tool to pretty-print JSON logs. Tidy, not AI-relevant. Minor weekend project.",
+      "metrics": {"upvotes": 40, "comments": 5}
+    },
+    {
+      "source": "reddit",
+      "family": "community",
+      "title": "Question: best laptop for running small models locally?",
+      "url": "https://reddit.com/r/LocalLLaMA/comments/xyz",
+      "author": "u/curious",
+      "published_at": "2026-06-22T09:00:00Z",
+      "raw_text": "Discussion thread asking about laptops for local inference. No new results, just chatter.",
+      "metrics": {"upvotes": 30, "comments": 22}
+    },
+    {
+      "source": "arxiv",
+      "family": "academia",
+      "title": "An incremental ablation on dropout schedules",
+      "url": "https://arxiv.org/abs/2606.09009",
+      "author": "Grad Student",
+      "published_at": "2026-06-22T06:00:00Z",
+      "raw_text": "A small ablation study on dropout schedules. Marginal effect. Not a venue paper, no broad impact. Optimization, narrowly.",
+      "metrics": {"citations": 0}
+    },
+    {
+      "source": "rss:somecorp",
+      "family": "industry",
+      "title": "Company blog: we updated our docs site theme",
+      "url": "https://somecorp.example/blog/docs-theme",
+      "author": "SomeCorp",
+      "published_at": "2026-06-22T10:00:00Z",
+      "raw_text": "We refreshed the documentation site theme. No product or model changes. Housekeeping.",
+      "metrics": {}
+    }
+  ]
+}

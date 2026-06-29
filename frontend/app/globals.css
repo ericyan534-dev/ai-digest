@@ -1,0 +1,72 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* --------------------------------------------------------------------------
+   Hybrid Editorial — paper-white theme + single ink-red accent.
+   Tokens mirror ../ACCEPTANCE.md and tailwind.config.ts.
+   -------------------------------------------------------------------------- */
+:root {
+  --paper: #faf8f3;
+  --ink: #1a1a1a;
+  --accent: #8b2e2e;
+  --muted: #6b6660;
+  --hairline: #e3ded4;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    background-color: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-serif), Georgia, serif;
+    line-height: 1.6;
+  }
+
+  /* Visible focus for keyboard users (accessibility). */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  ::selection {
+    background-color: rgba(139, 46, 46, 0.18);
+  }
+
+  a {
+    color: inherit;
+  }
+}
+
+@layer components {
+  /* Monospace label used for datelines, tags, metadata. */
+  .label-mono {
+    @apply font-mono text-[0.7rem] uppercase tracking-[0.14em] text-muted;
+  }
+
+  .hairline {
+    @apply border-hairline;
+  }
+
+  /* Skip link revealed on focus. */
+  .skip-link {
+    @apply sr-only;
+  }
+  .skip-link:focus {
+    @apply not-sr-only fixed left-3 top-3 z-50 rounded bg-ink px-3 py-2 font-mono text-xs text-paper;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

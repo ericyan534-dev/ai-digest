@@ -1,0 +1,76 @@
+name: Digest Pipeline
+
+# Required GitHub repository secrets:
+#   DATABASE_URL        — Managed Postgres connection string (PERSISTENT; not an ephemeral CI db)
+#   GEMINI_API_KEY      — Google Gemini API key
+# Optional secrets (delivery / richer ingestion / security):
+#   AIDIGEST_TIMEZONE, AIDIGEST_PUBLIC_BASE_URL, AIDIGEST_LINK_SECRET
+#   RESEND_API_KEY, DIGEST_FROM_EMAIL, DIGEST_TO_EMAIL
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+#   S2_API_KEY, REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET
+
+on:
+  schedule:
+    # All times UTC (GitHub cron has ~min jitter; DST never affects UTC crons).
+    - cron: "0 */3 * * *" # ingest — every 3 hours
+    - cron: "0 14 * * *" # daily — 14:00 UTC ≈ 07:00 America/Los_Angeles (PDT)
+    - cron: "0 15 * * 0" # weekly — Sunday 15:00 UTC ≈ 08:00 PDT
+    - cron: "0 11 * * *" # nightly recompute — 11:00 UTC ≈ 04:00 PDT
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Pipeline job to run"
+        required: true
+        type: choice
+        options: [ingest, daily, weekly, nightly]
+
+jobs:
+  pipeline:
+    name: Run pipeline job
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      AIDIGEST_LLM_MOCK: "0"
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      AIDIGEST_TIMEZONE: ${{ secrets.AIDIGEST_TIMEZONE }}
+      AIDIGEST_PUBLIC_BASE_URL: ${{ secrets.AIDIGEST_PUBLIC_BASE_URL }}
+      AIDIGEST_LINK_SECRET: ${{ secrets.AIDIGEST_LINK_SECRET }}
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      DIGEST_FROM_EMAIL: ${{ secrets.DIGEST_FROM_EMAIL }}
+      DIGEST_TO_EMAIL: ${{ secrets.DIGEST_TO_EMAIL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      S2_API_KEY: ${{ secrets.S2_API_KEY }}
+      REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+      REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Ingest
+        if: github.event.schedule == '0 */3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'ingest')
+        run: python -m scripts.ingest
+
+      - name: Daily digest
+        if: github.event.schedule == '0 14 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'daily')
+        run: python -m scripts.run_daily --deliver
+
+      - name: Weekly digest
+        if: github.event.schedule == '0 15 * * 0' || (github.event_name == 'workflow_dispatch' && inputs.job == 'weekly')
+        run: python -m scripts.run_weekly --deliver
+
+      - name: Nightly recompute
+        if: github.event.schedule == '0 11 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'nightly')
+        run: python -m scripts.run_nightly

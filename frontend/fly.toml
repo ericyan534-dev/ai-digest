@@ -1,0 +1,40 @@
+# Fly.io config for the ai-digest Next.js frontend.
+# Lives in frontend/ so Fly's build context is frontend/ and the Dockerfile's
+# COPY paths resolve correctly.
+# Deploy:  fly deploy -c frontend/fly.toml --build-arg NEXT_PUBLIC_API_BASE=https://ai-digest-api.fly.dev
+#
+# NEXT_PUBLIC_API_BASE is baked into the bundle at build time (browser reads it).
+# If the backend has AIDIGEST_API_KEY set, also give THIS app a server-only
+# secret so the proxy routes can forward it:
+#   fly secrets set AIDIGEST_API_KEY=<same-key> --app ai-digest-web
+
+app = "ai-digest-web"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+  [build.args]
+    NEXT_PUBLIC_API_BASE = "https://ai-digest-api.fly.dev"
+
+[env]
+  PORT = "3000"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval = "30s"
+    method = "GET"
+    path = "/"
+    timeout = "5s"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512

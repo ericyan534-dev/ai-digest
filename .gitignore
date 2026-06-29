@@ -1,0 +1,36 @@
+# --- secrets ---
+.env
+.env.local
+*.key
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+dist/
+build/
+
+# --- node / next ---
+node_modules/
+.next/
+out/
+npm-debug.log*
+.pnpm-debug.log*
+
+# --- data / runtime ---
+data/
+*.sqlite
+*.db
+.DS_Store
+*.log
+
+# --- editor ---
+.vscode/
+.idea/

@@ -1,0 +1,48 @@
+# Fly.io config for the ai-digest FastAPI backend.
+# Lives in backend/ so Fly's build context is backend/ and the Dockerfile's
+# COPY paths (requirements.txt, aidigest/, scripts/) resolve correctly.
+# Deploy:  fly deploy -c backend/fly.toml   (or: cd backend && fly deploy)
+#
+# Required secrets (fly secrets set KEY=value --app ai-digest-api):
+#   DATABASE_URL    — managed Postgres connection string with pgvector enabled
+#   GEMINI_API_KEY  — Google Gemini API key
+# Optional secrets:
+#   RESEND_API_KEY / DIGEST_FROM_EMAIL / DIGEST_TO_EMAIL   — email delivery
+#   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / TELEGRAM_WEBHOOK_SECRET
+#   AIDIGEST_API_KEY      — require X-API-Key on mutating endpoints
+#   AIDIGEST_LINK_SECRET  — sign email feedback links
+#   S2_API_KEY / REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET   — richer ingestion
+
+app = "ai-digest-api"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[deploy]
+  release_command = "python -m scripts.migrate"
+
+[env]
+  PORT = "8000"
+  # Used to build clickable email feedback links; set to this app's public URL.
+  AIDIGEST_PUBLIC_BASE_URL = "https://ai-digest-api.fly.dev"
+  AIDIGEST_TIMEZONE = "America/Los_Angeles"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/api/health"
+    timeout = "5s"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512

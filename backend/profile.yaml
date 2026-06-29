@@ -1,0 +1,110 @@
+# ai-digest — personal profile (Loop 1: static interests).
+# This file IS the personalization seed. It is embedded into an `interest_vector`
+# (personalize/profile.py) and drives the `personal` ranking score + the
+# "why it matters to you" angle in every digest. Edit freely; re-run nightly.
+
+owner: "me"
+
+# --- Editorial voice to emulate (daily + weekly generation) ---
+# Tone: fast-paced, dense, technical, plain, lightly opinionated, signal-over-fluff.
+# Short sentences. No marketing adjectives. Assume an expert reader.
+voice:
+  emulate:
+    - "Andrej Karpathy"
+    - "smol.ai / AINews (swyx)"
+    - "Yann LeCun"
+    - "Andrew Ng"
+  tone:
+    - fast-paced
+    - dense
+    - technical
+    - plain
+    - lightly-opinionated
+    - signal-over-fluff
+    - short-sentences
+    - no-marketing-adjectives
+    - expert-reader
+
+# --- Research / industry subfields the user cares about (rank relevance by these) ---
+# These strings are embedded to build the interest vector; order ~ priority.
+subfields:
+  - "Multi-Agent Systems"
+  - "Efficient and Scalable NLP"
+  - "Reinforcement Learning for NLP"
+  - "Large Language Models and Foundation Models"
+  - "Optimization"
+
+# --- Primary academic venues (boost stories from / about these) ---
+venues:
+  - "NeurIPS"
+  - "ACL"
+
+# --- Must-follow voices (authority boost when authored/mentioned) ---
+must_follow:
+  - "Andrej Karpathy"
+  - "swyx"
+  - "smol.ai"
+  - "Yann LeCun"
+  - "Andrew Ng"
+
+# --- Family weighting: how much the user values each source world (0..1) ---
+# Academia is the differentiator vs. smol.ai, so it is weighted high.
+family_weights:
+  academia: 0.9
+  industry: 0.8
+  community: 0.6
+  meta: 0.7
+
+# --- Topics / sources to mute (down-rank hard) ---
+mutes:
+  - "crypto"
+  - "AI doomerism drama"
+  - "low-effort agent-framework hype"
+
+# --- Ranking knobs (tunable; feedback/NL-steering moves these) ---
+# importance = w_mentions*cross_source + w_authority*src + w_recency*recency
+#            + w_engagement*engagement + w_citation*citation_velocity
+ranking:
+  importance_weights:
+    mentions: 0.30
+    authority: 0.20
+    recency: 0.20
+    engagement: 0.15
+    citation: 0.15
+  # final_rank = alpha*importance + beta*personal + gamma*diversity_bonus
+  alpha: 0.5     # importance
+  beta: 0.4      # personal fit
+  gamma: 0.1     # diversity bonus (reserves slots for academia / niche subfields)
+
+# --- Importance-tier thresholds (flexibility principle) ---
+# Drives how much the generator writes. See generate/importance.py.
+tiers:
+  # Tuned on real ingested data (2026-06-25): final_rank is compressed (~0.32–0.49
+  # for typical AI stories, because personal-fit ~0.6 dominates and is similar
+  # across AI items), while OBJECTIVE importance is the wider discriminator.
+  #   - breakthrough stays STRICT: reserved for cross-source-corroborated
+  #     mega-stories (high importance via the override, or final_rank ~0.72 that
+  #     only a multi-source academia story reaches). A single-source post is never
+  #     auto-"revolutionary".
+  #   - notable lowered to the real final_rank scale so clearly-notable top stories
+  #     (e.g. a major lab announcement at final_rank ~0.45) get a real takeaway
+  #     instead of being under-called as a one-line MINOR.
+  breakthrough_min_score: 0.72   # >= blended final_rank => BREAKTHROUGH (full depth, cannot be missed)
+  breakthrough_importance_override: 0.55  # raw OBJECTIVE importance alone forces BREAKTHROUGH (embedding-independent)
+  notable_min_score: 0.40        # >= final_rank => NOTABLE (standard takeaway)
+  minor_min_score: 0.30          # >= final_rank => MINOR (one-line trend note)
+  quiet_day_top_score: 0.40      # legacy final_rank gate (standalone classify_tier)
+  # 3-LEVEL day tier (drives digest depth), on the day's max OBJECTIVE importance
+  # (cross-source + engagement + citation, NOT personal fit). Tuned for the
+  # noisy-OR importance harness: a viral launch (~2.5k pts) -> ~0.9 (BREAKTHROUGH);
+  # a real discussion (~300 pts) -> ~0.4 (NOTABLE); routine single-source -> < 0.32.
+  quiet_day_min_importance: 0.32   # below this => QUIET day (trend recaps only)
+  notable_day_min_importance: 0.32 # at/above => NOTABLE; >= breakthrough_override => BREAKTHROUGH
+
+# --- Processing knobs (clustering; tuned on real ingested+embedded items) ---
+processing:
+  # Complete-link cosine threshold for grouping items into ONE story. Measured on
+  # real AI-news embeddings: unrelated items sit at ~0.71 median cosine, up to
+  # ~0.86; this sits just above that ceiling so cross-source dups of the SAME
+  # story merge while distinct topics stay apart. Lower => more merging.
+  cluster_threshold: 0.86
