@@ -154,6 +154,28 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> FakeRepo:
     return repo
 
 
+def test_balanced_pool_caps_per_source() -> None:
+    # A high-volume source must not crowd out others; each source is capped to N
+    # most-recent, bounding the O(n^3) clustering pool.
+    from datetime import timedelta
+
+    base = datetime.now(UTC)
+    items = [
+        Item.create(source="arxiv", family=Family.ACADEMIA, title=f"p{i}",
+                    url=f"https://arxiv.org/abs/{i}", published_at=base - timedelta(minutes=i))
+        for i in range(50)
+    ] + [
+        Item.create(source="hn", family=Family.COMMUNITY, title="hot",
+                    url="https://news.ycombinator.com/item?id=1", published_at=base),
+    ]
+    pooled = pipeline.balanced_pool(items, per_source=20)
+    assert sum(it.source == "arxiv" for it in pooled) == 20  # capped
+    assert sum(it.source == "hn" for it in pooled) == 1  # under cap -> kept
+    # the kept arxiv items are the most RECENT (smallest minute offset)
+    kept_titles = {it.title for it in pooled if it.source == "arxiv"}
+    assert "p0" in kept_titles and "p49" not in kept_titles
+
+
 @pytest.mark.asyncio
 async def test_run_ingest_writes_items(wired: FakeRepo) -> None:
     n = await pipeline.run_ingest()
