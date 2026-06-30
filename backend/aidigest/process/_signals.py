@@ -8,9 +8,25 @@ roughly comparable 0..1+ range before weighting.
 from __future__ import annotations
 
 import math
+import re
 from datetime import UTC, datetime
 
 from aidigest.models import Family, Item
+
+# A concrete release / announcement (a real model/product/result shipping) — the
+# kind of title that legitimizes a high-engagement single-source story as genuinely
+# important. A viral anecdote/drama title ("my resume scored 90/100", "second
+# opinion on my MRI") matches NONE of these. Mirrors generate.daily._ANNOUNCE_RE.
+_RELEASE_TITLE_RE = re.compile(
+    r"\b(unveils?|introduc\w+|releas\w+|launch\w+|announc\w+|ships?|debuts?|"
+    r"open[- ]?sourc\w+|presents?|now available)\b",
+    re.IGNORECASE,
+)
+
+
+def is_release_title(title: str) -> bool:
+    """True when a title reads as a concrete release/announcement (not an anecdote)."""
+    return bool(_RELEASE_TITLE_RE.search(title or ""))
 
 # Default per-family source authority (overridable via profile family_weights).
 _FAMILY_AUTHORITY: dict[Family, float] = {
@@ -114,4 +130,5 @@ __all__ = [
     "recency_score",
     "age_days",
     "representative_score",
+    "is_release_title",
 ]

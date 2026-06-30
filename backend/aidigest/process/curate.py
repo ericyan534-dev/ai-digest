@@ -100,6 +100,26 @@ def _is_self_promo(story: Story) -> bool:
     return title.startswith(_SELF_PROMO_PREFIXES) or "[p]" in title
 
 
+# Viral-but-worthless framings for an AI *research* digest: personal anecdotes
+# (medical / resume / career) that trend on HN but carry zero research/industry
+# signal — e.g. "I used Claude to get a second opinion on my MRI", "My resume scored
+# 90/100". High-precision so it never nukes a real story; the LLM curator handles the
+# broader semantic class (institutional drama, takedown complaints, culture-war takes).
+# Gated to single-source so a corroborated story is never keyword-dropped.
+_NOISE_RE = re.compile(
+    r"\b(my (resume|cv|mri|ct scan|x[- ]?ray|tumou?r|cancer|diagnosis|blood ?work|"
+    r"salary|landlord|boss|professor|grade|exam)|second opinion)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_low_signal_noise(story: Story) -> bool:
+    """Single-source viral personal-anecdote noise (drop pre-LLM, deterministically)."""
+    if story.mention_count > 1:
+        return False
+    return bool(_NOISE_RE.search(story.title or ""))
+
+
 def _listing(stories: list[Story]) -> str:
     rows: list[str] = []
     for i, s in enumerate(stories):
@@ -116,8 +136,8 @@ async def curate_stories(
     settings = get_settings()
     if settings.llm_mock or not getattr(settings, "relevance_filter", True):
         return stories
-    # Hard pre-filter the explicit self-promo framings before spending an LLM call.
-    stories = [s for s in stories if not _is_self_promo(s)]
+    # Hard pre-filter the explicit self-promo + viral-anecdote noise before the LLM.
+    stories = [s for s in stories if not _is_self_promo(s) and not _is_low_signal_noise(s)]
     if len(stories) <= 1:
         return stories
 
@@ -142,9 +162,22 @@ async def curate_stories(
         "- DROP trivial tools, tutorials, off-topic posts, and narrow product releases "
         "unrelated to the subfields (e.g. OCR, image editing) unless they materially "
         "advance them.\n"
-        "- DROP pure vendor marketing / blog essays / customer case studies with no "
-        "concrete release or result (e.g. 'how agents are transforming work') — keep "
-        "the actual release, not the press piece.\n"
+        "- DROP papers OUTSIDE the reader's subfields even when they use ML — e.g. ML "
+        "applied to optical networks, telecom, energy grids, generic IoT, or domain "
+        "verticals (medical imaging, chemistry) that do not advance LLMs / RL / agents "
+        "/ the listed subfields. Keep only genuinely on-subfield research.\n"
+        "- DROP pure vendor marketing / blog essays / customer case studies / EXPLAINERS "
+        "with no concrete release or result — e.g. 'how agents are transforming work', "
+        "'what exactly is the full stack?', 'ask an AI expert ...', or workforce / "
+        "economic-impact / policy-report think-pieces. Keep the actual release or "
+        "concrete deal, NOT the press essay.\n"
+        "- DROP viral-but-shallow Hacker News / Reddit content that carries NO concrete "
+        "AI research, product, or result — NO MATTER HOW MANY UPVOTES. This includes: "
+        "personal anecdotes ('I used AI to ...', medical / resume / career stories), "
+        "institutional or culture-war drama (exam cheating, fraud accusations, "
+        "lawsuits-as-gossip, layoffs hot-takes), and platform / takedown / moderation "
+        "complaints. A front-page meme is still a meme — high engagement is NOT worth. "
+        "If there is a concrete development buried inside, keep ONLY that, not the drama.\n"
         "- A single-source community post with no discussion is NOT worth a slot.\n\n"
         "Be SELECTIVE — quality over quantity. Better 6 strong items than 12 padded.\n\n"
         "For EACH kept story, ALSO assign its TOPIC family by what the story is ABOUT "

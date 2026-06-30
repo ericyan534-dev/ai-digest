@@ -28,7 +28,7 @@ from aidigest.personalize.profile import build_interest_vector, load_profile
 from aidigest.process.cluster import cluster_into_stories
 from aidigest.process.curate import curate_stories
 from aidigest.process.embed import embed_items
-from aidigest.process.rank import score_stories
+from aidigest.process.rank import apply_announcement_floor, score_stories
 from scripts._common import setup_logging
 
 # Academia (arXiv / HF papers) gets a WIDER lookback than news. A paper's date is its
@@ -91,6 +91,7 @@ async def _run(hours: int, per_source: int, deliver: bool) -> None:
     stories = score_stories(stories, interest_vector=interest, profile=profile)
     before = len(stories)
     stories = await curate_stories(stories, profile=profile, llm=llm)
+    stories = apply_announcement_floor(stories)  # real announcements register as notable
     print(f"# curated: {before} -> {len(stories)} worthy stories  ({_family_counts(stories)})", file=sys.stderr)
     stories, _overall, quiet = classify_day(stories, profile=profile)
 

@@ -80,6 +80,24 @@ def test_is_self_promo() -> None:
     assert not _is_self_promo(corroborated)
 
 
+def test_is_low_signal_noise() -> None:
+    from aidigest.process.curate import _is_low_signal_noise
+
+    # The exact viral-anecdote posts that must NEVER reach the digest.
+    assert _is_low_signal_noise(_story(1, "I used Claude Code to get a second opinion on my MRI"))
+    assert _is_low_signal_noise(
+        _story(2, "HackerRank open sourced its ATS. My resume scored 90/100. Oh wait 74. No - 88")
+    )
+    # Real research/industry stories are untouched.
+    assert not _is_low_signal_noise(_story(3, "GLM 5.2 beats Claude in our benchmarks"))
+    assert not _is_low_signal_noise(_story(4, "OpenAI unveils GPT-5.6 Sol", Family.INDUSTRY))
+    # Corroborated across sources -> survives even with an anecdotal keyword.
+    corroborated = _story(5, "My resume parser beats the SOTA").model_copy(
+        update={"mention_count": 3}
+    )
+    assert not _is_low_signal_noise(corroborated)
+
+
 @pytest.mark.asyncio
 async def test_curate_drops_low_signal(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(curate, "get_settings", _live)
