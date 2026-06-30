@@ -58,12 +58,35 @@ DAILY_LOOKBACK = timedelta(hours=36)
 ACADEMIA_LOOKBACK = timedelta(hours=96)
 WEEKLY_LOOKBACK = timedelta(days=8)
 
+# Per-source cap on the daily embed/cluster pool. Complete-link clustering is O(n^3),
+# so an uncapped 96h window (hundreds of arXiv + HN items) makes processing crawl for
+# tens of minutes. Capping each source to its most-recent N (high-volume sources like
+# arXiv/HN don't crowd out academia/industry) keeps n ~100 and MATCHES the validated
+# preview path, so the automation produces the same digest that was validated offline.
+DAILY_ITEM_PER_SOURCE_CAP = 20
+
 
 def _in_daily_window(item: Item, now: datetime) -> bool:
     """Family-aware freshness gate: academia gets ACADEMIA_LOOKBACK, the rest the
     strict DAILY_LOOKBACK. Keeps research present without leaking stale news."""
     span = ACADEMIA_LOOKBACK if item.family == Family.ACADEMIA else DAILY_LOOKBACK
     return item.published_at >= now - span
+
+
+def balanced_pool(items: list[Item], *, per_source: int = DAILY_ITEM_PER_SOURCE_CAP) -> list[Item]:
+    """Cap EACH source to its most-recent `per_source` items.
+
+    Bounds the O(n^3) clustering pool and stops a high-volume source (arXiv, HN) from
+    crowding academia/industry out. Shared by run_process and scripts.preview_daily so
+    the automation and the offline preview cluster the SAME bounded set.
+    """
+    from collections import defaultdict
+
+    by_src: dict[str, list[Item]] = defaultdict(list)
+    for it in sorted(items, key=lambda x: x.published_at, reverse=True):
+        if len(by_src[it.source]) < per_source:
+            by_src[it.source].append(it)
+    return [it for lst in by_src.values() for it in lst]
 
 
 # --------------------------------------------------------------------------- #
@@ -139,7 +162,11 @@ async def run_process(*, since: datetime | None = None) -> int:
         items = await repo.get_items_since(load_since)
         if not explicit_since:
             items = [it for it in items if _in_daily_window(it, now)]
-        s.set(items=len(items))
+            loaded = len(items)
+            items = balanced_pool(items)  # bound the O(n^3) clustering pool
+            s.set(loaded=loaded, items=len(items))
+        else:
+            s.set(items=len(items))
 
     if not items:
         logger.info("step=process status=skip reason=no_items")

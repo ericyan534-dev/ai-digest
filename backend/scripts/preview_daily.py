@@ -39,17 +39,9 @@ from scripts._common import setup_logging
 # far enough to always have material for the research-trends recap.
 _ACADEMIA_LOOKBACK_HOURS = 96
 
-
-def _balanced_pool(items: list, *, per_source: int) -> list:
-    """Cap EACH source to its most-recent `per_source` items so high-volume sources
-    (arXiv, HN) don't crowd academia/industry out of the embed pool."""
-    from collections import defaultdict
-
-    by_src: dict[str, list] = defaultdict(list)
-    for it in sorted(items, key=lambda x: x.published_at, reverse=True):
-        if len(by_src[it.source]) < per_source:
-            by_src[it.source].append(it)
-    return [it for lst in by_src.values() for it in lst]
+# Shared with run_process so the offline preview clusters the SAME bounded pool the
+# automation does (identical digest output).
+from aidigest.flows.pipeline import balanced_pool as _balanced_pool  # noqa: E402
 
 
 def _family_counts(stories: list) -> str:
