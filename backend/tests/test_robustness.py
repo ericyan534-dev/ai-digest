@@ -11,6 +11,7 @@ from aidigest.deliver.render_md import render_telegram_text  # noqa: E402
 from aidigest.generate.daily import (  # noqa: E402
     _announce_score,
     _clip,
+    _clip_to_sentence,
     _dedupe_leads,
     _is_dup_lead,
     _lead_sort_key,
@@ -148,6 +149,20 @@ def test_clip_prefers_sentence_end() -> None:
     text = "First full sentence here is plenty long. Then a second clause continues on and on."
     out = _clip(text, 60)
     assert out == "First full sentence here is plenty long."  # clean period, no ellipsis
+
+
+def test_clip_to_sentence_never_cuts_mid_sentence() -> None:
+    # Two full sentences end early (~46% of the limit); a third is half-written. The
+    # intro clip must keep the two complete sentences, NOT cut into the third with "…".
+    text = (
+        "Korean giants committed $550B to memory while Arena became a $100M business. "
+        "That reshapes the eval market. To secure critical footprints the labs are now "
+        "racing to lock in long-term compute and data partnerships across regions."
+    )
+    out = _clip_to_sentence(text, 200)
+    assert out.endswith("business. That reshapes the eval market.")
+    assert "…" not in out
+    assert "To secure" not in out  # the half-started third sentence is dropped
 
 
 def test_announce_score() -> None:

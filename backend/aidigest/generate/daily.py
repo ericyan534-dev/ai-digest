@@ -110,6 +110,22 @@ def _clip(text: str, limit: int) -> str:
     return (cut[:space] if space > 0 else cut).rstrip() + "…"
 
 
+def _clip_to_sentence(text: str, limit: int) -> str:
+    """Trim to <= limit chars ending at the LAST complete sentence — no mid-sentence
+    cut, no trailing ellipsis. For trend-recap intros, which must read as finished
+    prose (a synthesis paragraph that stops at "…business. To secure crit…" looks
+    broken). Unlike _clip there is no 'first half' guard: any sentence end wins, so a
+    2-sentence intro is never butchered to fit a half-started third sentence."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    best = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    if best > 0:
+        return cut[: best + 1].strip()
+    return _clip(text, limit)  # no sentence boundary at all — fall back to word clip
+
+
 def _canonical_tags(tags: list[str], profile: dict) -> list[str]:
     """Map model tags to the EXACT subfield strings from the profile (consistent
     casing/punctuation): "Efficient & Scalable NLP" and "Efficient and Scalable
@@ -372,7 +388,9 @@ async def _trend_intro(
         json_schema=_TREND_SCHEMA,
         temperature=0.4,
     )
-    return _clip(str(parse_json_obj(raw).get("summary") or "").strip().rstrip(" ,;"), 500)
+    return _clip_to_sentence(
+        str(parse_json_obj(raw).get("summary") or "").strip().rstrip(" ,;"), 520
+    )
 
 
 async def _top_stories_section(

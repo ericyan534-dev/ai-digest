@@ -15,9 +15,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from aidigest.generate.importance import classify_day
+from aidigest.generate.importance import classify_day, classify_day_tier
 from aidigest.models import Family, ImportanceTier, Story
-from aidigest.process.rank import score_stories
+from aidigest.process.rank import apply_announcement_floor, score_stories
 
 
 def _strong_story(*, embedding: list[float] | None) -> Story:
@@ -65,3 +65,94 @@ def test_breakthrough_survives_missing_embedding(profile: dict) -> None:
     )
     tagged, _overall, _quiet = classify_day(scored, profile=profile)
     assert tagged[0].tier == ImportanceTier.BREAKTHROUGH
+
+
+# --------------------------------------------------------------------------- #
+# Substance gate: virality ALONE must NOT be a breakthrough (the resume/MRI bug)
+# --------------------------------------------------------------------------- #
+
+
+def _viral_single_source(title: str, *, family: Family = Family.COMMUNITY) -> Story:
+    """A maximally-viral but UNCORROBORATED post: one source, no citation."""
+    return Story(
+        id="viral", title=title, family=family,
+        item_ids=["v1"], representative_item_id="v1",
+        embedding=None, mention_count=1, engagement=1.0, citation=0.0,
+        created_at=datetime.now(UTC),
+    )
+
+
+def test_viral_meme_is_not_a_breakthrough(profile: dict) -> None:
+    # A single-source HN meme with max engagement must stay BELOW the breakthrough
+    # override and out of the top tier — upvotes alone are not a breakthrough.
+    story = _viral_single_source("My resume scored 90/100. Oh wait 74. No - 88")
+    scored = score_stories([story], interest_vector=None, profile=profile)
+    override = float(profile["tiers"]["breakthrough_importance_override"])
+    assert scored[0].importance < override, (
+        f"uncorroborated viral importance {scored[0].importance} >= override {override}"
+    )
+    tagged, overall, _quiet = classify_day(scored, profile=profile)
+    assert tagged[0].tier != ImportanceTier.BREAKTHROUGH
+    assert overall != ImportanceTier.BREAKTHROUGH  # a viral meme can't make a breakthrough day
+
+
+def test_single_source_release_still_reaches_breakthrough(profile: dict) -> None:
+    # The gate must NOT bury a real single-source LAUNCH: release framing is a
+    # substance signal, so engagement is not discounted and importance stays high.
+    story = _viral_single_source("OpenAI unveils GPT-5.6 Sol", family=Family.COMMUNITY)
+    scored = score_stories([story], interest_vector=None, profile=profile)
+    override = float(profile["tiers"]["breakthrough_importance_override"])
+    assert scored[0].importance >= override, (
+        f"single-source RELEASE importance {scored[0].importance} < override {override}"
+    )
+
+
+def test_corroborated_viral_still_reaches_breakthrough(profile: dict) -> None:
+    # Cross-source corroboration is a substance signal even without release framing.
+    story = _viral_single_source("GLM 5.2 beats Claude in our benchmarks").model_copy(
+        update={"mention_count": 4, "item_ids": ["a", "b", "c", "d"]}
+    )
+    scored = score_stories([story], interest_vector=None, profile=profile)
+    override = float(profile["tiers"]["breakthrough_importance_override"])
+    assert scored[0].importance >= override
+
+
+# --------------------------------------------------------------------------- #
+# Announcement floor: real news without upvotes must not read as a "quiet day"
+# --------------------------------------------------------------------------- #
+
+
+def _announcement(title: str, family: Family) -> Story:
+    """A real announcement with NO engagement (a press release has no upvotes)."""
+    return Story(
+        id=title[:10], title=title, family=family,
+        item_ids=["i"], representative_item_id="i",
+        importance=0.05, mention_count=1, engagement=0.0, citation=0.0,
+        created_at=datetime.now(UTC),
+    )
+
+
+def test_announcement_floor_lifts_industry_to_notable(profile: dict) -> None:
+    # An engagement-less industry deal must lift the day OUT of "quiet" — but never to
+    # breakthrough.
+    story = _announcement("Anthropic and California forge a Claude deal", Family.INDUSTRY)
+    assert classify_day_tier([story], profile=profile) == ImportanceTier.QUIET_DAY  # before
+    floored = apply_announcement_floor([story])
+    override = float(profile["tiers"]["breakthrough_importance_override"])
+    notable = float(profile["tiers"]["notable_day_min_importance"])
+    assert notable <= floored[0].importance < override
+    assert classify_day_tier(floored, profile=profile) == ImportanceTier.NOTABLE  # after
+
+
+def test_announcement_floor_release_title_in_community(profile: dict) -> None:
+    # A release-titled story floors even if it surfaced under a non-industry family.
+    story = _announcement("Mistral releases an open 70B model", Family.COMMUNITY)
+    floored = apply_announcement_floor([story])
+    assert floored[0].importance >= float(profile["tiers"]["notable_day_min_importance"])
+
+
+def test_announcement_floor_leaves_non_announcements(profile: dict) -> None:
+    # A low-importance community chatter post is NOT floored — only real announcements.
+    story = _announcement("anyone else notice gpt is slower today?", Family.COMMUNITY)
+    floored = apply_announcement_floor([story])
+    assert floored[0].importance == story.importance  # untouched

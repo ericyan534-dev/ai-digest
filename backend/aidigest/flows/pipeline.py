@@ -46,7 +46,7 @@ from aidigest.process.cluster import cluster_into_stories
 from aidigest.process.curate import curate_stories
 from aidigest.process.embed import embed_items
 from aidigest.process.enrich import enrich_stories
-from aidigest.process.rank import score_stories
+from aidigest.process.rank import apply_announcement_floor, score_stories
 
 # Default look-back windows. News uses the strict daily window (no stale
 # announcements leaking into the wrong day); academia (arXiv / HF papers) uses a
@@ -151,6 +151,7 @@ async def run_process(*, since: datetime | None = None) -> int:
 
     async with step("curate") as s:
         kept = await curate_stories(stories, profile=profile, llm=llm)  # type: ignore[arg-type]
+        kept = apply_announcement_floor(kept)  # real announcements register as notable
         s.set(before=len(stories), after=len(kept))
         stories = kept
 

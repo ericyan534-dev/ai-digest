@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from aidigest.models import Family, Story
+from aidigest.process._signals import is_release_title
 from aidigest.process._vec import cosine as _cosine
 
 _FAMILY_AUTHORITY: dict[Family, float] = {
@@ -22,6 +23,28 @@ _FAMILY_AUTHORITY: dict[Family, float] = {
     Family.META: 0.7,
     Family.COMMUNITY: 0.6,
 }
+
+# A single-source viral post is suggestive, not conclusive: upvotes alone must NOT
+# crown a Hacker News meme a "breakthrough". When a story has NO corroborating
+# signal (cross-source mentions, citations, or an explicit release/announcement),
+# its engagement is discounted to this fraction so it lands in NOTABLE range and can
+# never reach the BREAKTHROUGH importance bar (or mark the whole day a breakthrough).
+_UNCORROBORATED_ENGAGEMENT_FACTOR = 0.5
+
+
+def _is_substantive(story: Story, citation: float) -> bool:
+    """Does the story carry a signal of REAL significance beyond raw single-source
+    virality? Cross-source corroboration, citation velocity, or a concrete
+    release/announcement title all qualify; a lone viral community thread (a
+    front-page meme, a personal anecdote, an institutional-drama post) does not.
+
+    Family is intentionally NOT used: importance is scored BEFORE the curator
+    reclassifies topic family, so a model story surfacing on HN is still COMMUNITY
+    here — corroboration/citation/release framing are the reliable signals at this
+    stage. A genuine major launch is corroborated or framed as a release; a viral
+    anecdote is neither.
+    """
+    return story.mention_count > 1 or citation > 0.0 or is_release_title(story.title)
 
 
 def cosine(a: list[float], b: list[float]) -> float:
@@ -53,7 +76,14 @@ def importance_score(story: Story, *, profile: dict) -> float:
     engagement = max(0.0, min(1.0, float(story.engagement)))
     citation = max(0.0, min(1.0, float(story.citation)))
 
-    # Noisy-OR: ANY one exceptional signal (a viral launch, broad cross-source
+    # SUBSTANCE GATE: a single-source viral post is not a breakthrough on upvotes
+    # alone. With no corroboration/citation/release framing, discount its engagement
+    # so it lands in NOTABLE range — never the BREAKTHROUGH bar, and never enough to
+    # mark a "breakthrough day". This is what keeps a viral HN meme out of the lead.
+    if not _is_substantive(story, citation):
+        engagement *= _UNCORROBORATED_ENGAGEMENT_FACTOR
+
+    # Noisy-OR: ANY one exceptional signal (a viral *launch*, broad cross-source
     # corroboration, OR fast citations) should drive importance high on its own —
     # that is how a genuine breakthrough is DETECTED. A weighted sum capped each
     # signal's reach and silently buried single-source blockbusters (e.g. a 2.6k-pt
@@ -63,6 +93,33 @@ def importance_score(story: Story, *, profile: dict) -> float:
     modulator = 0.80 + 0.20 * authority  # 0.92..1.0 — gentle credibility nudge
     recency_blend = 0.75 + 0.25 * _recency(story)  # 0.75..1.0 — old items not zeroed
     return max(0.0, min(1.0, attention * modulator * recency_blend))
+
+
+# A confirmed announcement is NEWS even with zero upvotes — a lab blog post has no
+# engagement signal, yet "Anthropic signs a state government" is a notable day. Floor
+# such stories into the NOTABLE band so real announcements lift the day above "quiet"
+# and can lead — WITHOUT reaching the breakthrough bar (that still needs real
+# attention). Kept below breakthrough_importance_override (0.55) by construction.
+_ANNOUNCEMENT_IMPORTANCE_FLOOR = 0.42
+
+
+def apply_announcement_floor(stories: list[Story]) -> list[Story]:
+    """Raise importance for confirmed announcements to the NOTABLE floor (post-curation).
+
+    Applied AFTER the curator has assigned the TOPIC family, so an INDUSTRY story (a
+    real model/product/funding/policy announcement) or any explicit release-titled
+    story registers as notable even though a press release carries no upvotes. This is
+    the counterpart to the substance gate: virality must not INFLATE a meme, and a real
+    announcement must not be INVISIBLE. Never raises a story to the breakthrough bar.
+    """
+    out: list[Story] = []
+    for s in stories:
+        is_announcement = s.family == Family.INDUSTRY or is_release_title(s.title)
+        if is_announcement and s.importance < _ANNOUNCEMENT_IMPORTANCE_FLOOR:
+            out.append(s.model_copy(update={"importance": _ANNOUNCEMENT_IMPORTANCE_FLOOR}))
+        else:
+            out.append(s)
+    return out
 
 
 def score_stories(
@@ -138,4 +195,10 @@ def _recency(story: Story) -> float:
     return float(0.5 ** (age_days / 2.0)) if age_days >= 0 else 1.0
 
 
-__all__ = ["score_stories", "importance_score", "personal_score", "cosine"]
+__all__ = [
+    "score_stories",
+    "importance_score",
+    "personal_score",
+    "apply_announcement_floor",
+    "cosine",
+]
