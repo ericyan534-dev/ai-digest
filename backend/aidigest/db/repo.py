@@ -187,6 +187,21 @@ class Repo:
                         )
         return len(stories)
 
+    async def delete_stories_for_date(self, date: str) -> int:
+        """Delete all stories bucketed to the given LOCAL day (story_items cascade).
+
+        Lets run_process REPLACE a day's stories instead of accumulating them, so a
+        re-process always yields the canonical current set — a story dropped by the
+        (possibly newly-fixed) curator can never linger from an earlier run.
+        """
+        tz = get_settings().timezone
+        async with self._require_pool().connection() as conn:
+            cur = await conn.execute(
+                "DELETE FROM stories WHERE (created_at AT TIME ZONE %s)::date = %s::date",
+                [tz, date],
+            )
+            return cur.rowcount
+
     async def get_stories_for_date(self, date: str) -> list[Story]:
         # created_at is stored UTC (timestamptz); bucket by the user's LOCAL day so
         # the daily digest matches _today_iso() even when the UTC date differs from

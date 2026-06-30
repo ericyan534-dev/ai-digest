@@ -91,6 +91,11 @@ class FakeRepo:
     async def get_stories_for_date(self, date: str) -> list[Story]:
         return list(self.stories.values())
 
+    async def delete_stories_for_date(self, date: str) -> int:
+        n = len(self.stories)
+        self.stories.clear()
+        return n
+
     async def get_feedback(
         self, *, signal: object | None = None, since: datetime | None = None
     ) -> list[Feedback]:

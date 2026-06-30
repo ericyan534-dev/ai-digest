@@ -155,6 +155,8 @@ async def curate_stories(
         "- INDUSTRY: real announcements from AI labs or companies. Keep these.\n"
         "- COMMUNITY/META: substantive analyses or widely-discussed threads.\n\n"
         "HARD RULES (the reader hates low-signal self-promo):\n"
+        "- DROP stories NOT about AI/ML/LLMs even if they trended (general politics, "
+        "privacy/VPN tools, consumer gadgets, crypto) — AI must be the SUBJECT.\n"
         '- DROP any item whose SOURCE is self-promotional — "Show HN", "[P]" personal '
         "projects, a personal/startup blog, or a one-off GitHub repo — EVEN IF the "
         "underlying topic is interesting. If the topic is genuinely big it will also "
@@ -192,12 +194,17 @@ async def curate_stories(
         "as the subject.\n"
         "- 'meta': a curator's own newsletter/roundup (smol.ai, Latent Space, Interconnects).\n"
         'Return ONLY JSON: {"keep": [{"n": number, "family": '
-        '"academia"|"industry"|"community"|"meta"}, ...]}.\n\n'
+        '"academia"|"industry"|"community"|"meta"}, ...]}. Use ONE object per kept '
+        "story with its OWN single number — NEVER merge several numbers into one.\n\n"
         f"{_listing(stories)}\n"
     )
     raw = await client.generate(prompt, json_schema=_SCHEMA, temperature=0.0)
     kept = _parse_keep(raw, n=len(stories))
-    if kept is None:  # parse failure -> keep all (never nuke the digest)
+    # Never nuke the digest on a curation glitch: a parse failure (None) OR a result
+    # that drops EVERYTHING (e.g. the model concatenated all numbers into one giant
+    # out-of-range integer) falls back to keeping all — downstream ranking + per-family
+    # caps + the deterministic pre-filters still produce a sane, drama-free digest.
+    if not kept:
         return stories
     out: list[Story] = []
     for idx, family in kept:

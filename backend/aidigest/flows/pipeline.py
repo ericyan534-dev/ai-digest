@@ -188,8 +188,12 @@ async def run_process(*, since: datetime | None = None) -> int:
         s.set(stories=len(stories))
 
     async with step("upsert_stories") as s:
+        # REPLACE today's stories rather than accumulate: clear the local day first so
+        # a re-process yields exactly the current curated set (no stale survivors from
+        # an earlier/buggier run). Skipped for explicit-since replays of past days.
+        deleted = 0 if explicit_since else await repo.delete_stories_for_date(_today_iso())
         n = await repo.upsert_stories(stories)
-        s.set(written=n)
+        s.set(deleted=deleted, written=n)
     return len(stories)
 
 
@@ -338,10 +342,18 @@ async def run_daily(*, date: str | None = None, deliver: bool = False) -> DailyD
 
 
 async def _stories_for_date(repo: Repo, date: str) -> tuple[list[Story], dict[str, Item]]:
-    """Load (or build) the day's stories + the items that back them."""
+    """Load (or build) the day's stories + the items that back them.
+
+    For TODAY this ALWAYS re-processes: run_process replaces today's stories, so the
+    digest reflects the latest items + the current (fixed) pipeline and never serves a
+    stale set cached by an earlier run. Past-date replays use whatever is stored.
+    """
     async with step("load_stories") as s:
+        if date == _today_iso():
+            logger.info("step=load_stories action=reprocess_today")
+            await run_process()
         stories = await repo.get_stories_for_date(date)
-        if not stories:
+        if not stories and date != _today_iso():
             logger.info("step=load_stories status=empty action=run_process")
             await run_process()
             stories = await repo.get_stories_for_date(date)
