@@ -372,6 +372,11 @@ class FakeRepo:
 
         return [s for s in self._stories.values() if _local_date(s) == date]
 
+    async def delete_stories_for_date(self, date: str) -> int:
+        for_date = {s.id for s in await self.get_stories_for_date(date)}
+        self._stories = {sid: s for sid, s in self._stories.items() if sid not in for_date}
+        return len(for_date)
+
     async def get_stories_by_ids(self, ids: list[str]) -> list:
         return [self._stories[i] for i in ids if i in self._stories]
 

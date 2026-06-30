@@ -128,3 +128,20 @@ async def test_curate_parse_failure_keeps_all(monkeypatch: pytest.MonkeyPatch) -
 
     stories = [_story(1, "a"), _story(2, "b")]
     assert await curate_stories(stories, profile={}, llm=_Bad()) == stories
+
+
+@pytest.mark.asyncio
+async def test_curate_malformed_output_keeps_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The model occasionally concatenates every number into one giant out-of-range
+    # integer; that must fall back to keeping all, NEVER an empty digest.
+    monkeypatch.setattr(curate, "get_settings", _live)
+
+    class _Concat:
+        model = "concat"
+
+        async def generate(self, *a, **k):  # type: ignore[no-untyped-def]
+            return json.dumps({"keep": [{"n": 152134810112126282930323437465052}]})
+
+    stories = [_story(1, "a"), _story(2, "b"), _story(3, "c")]
+    out = await curate_stories(stories, profile={}, llm=_Concat())
+    assert out == stories  # never nuked to empty
