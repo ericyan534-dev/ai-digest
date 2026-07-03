@@ -10,7 +10,12 @@ Write the takeaway for ONE story for today's digest. Honor its tier exactly.
 - Cross-source mentions: {mention_count}
 - The reader's subfields: {subfields}
 
-## Source material (do not contradict it; do not invent beyond it)
+## Source material — write ONLY from this; do not invent beyond it
+
+Every number, benchmark, mechanism, and attribution you write MUST appear in the
+text below. If the source is only a headline (no body), state ONLY what the
+headline itself says and say the details are not yet available — do NOT invent a
+result, a number, or a mechanism to fill space.
 
 {sources}
 

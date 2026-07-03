@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import re
 
+from aidigest.generate._grounding import is_thin_source, source_digits, strip_ungrounded
 from aidigest.generate._shared import (
     parse_json_obj,
     sources_block,
@@ -167,27 +168,35 @@ async def map_story(
             score=story.final_rank,
         )
 
+    # GROUNDING: when the only source is a headline (no body text), the model has
+    # nothing to write depth from and will invent numbers/mechanisms — so generate at
+    # MINOR depth (one grounded line) regardless of the display tier. The display tier
+    # is unchanged; only the amount we let the model WRITE is capped.
+    gen_tier = ImportanceTier.MINOR if is_thin_source(story, items_by_id) else tier
+
     prompt_body = load_prompt(DAILY_MAP).format(
         title=story.title,
         family=story.family.value,
-        tier=tier.value,
+        tier=gen_tier.value,
         mention_count=story.mention_count,
         subfields=subfields_str(profile),
         sources=sources_block(story, items_by_id),
-        tier_instruction=tier_instruction(tier),
+        tier_instruction=tier_instruction(gen_tier),
     )
     messages = [
         Message(role="system", content=voice_prompt()),
         Message(role="user", content=prompt_body),
     ]
-    raw = await llm.generate(messages, json_schema=_MAP_SCHEMA, temperature=0.6)
+    raw = await llm.generate(messages, json_schema=_MAP_SCHEMA, temperature=0.4)
     parsed = parse_json_obj(raw)
 
-    takeaway = _clip(
-        str(parsed.get("takeaway") or "").strip() or story.title,
-        _TAKEAWAY_LIMITS.get(tier, 700),
-    )
-    why = _clip(str(parsed.get("why_it_matters") or "").strip(), _WHY_LIMIT)
+    # GROUNDING: drop any sentence whose benchmark/number/$ figure is absent from the
+    # real source text — a fabricated "40% speedup" is worse than none.
+    grounding = source_digits(story, items_by_id)
+    takeaway_text, _ = strip_ungrounded(str(parsed.get("takeaway") or "").strip(), grounding)
+    why_text, _ = strip_ungrounded(str(parsed.get("why_it_matters") or "").strip(), grounding)
+    takeaway = _clip(takeaway_text or story.title, _TAKEAWAY_LIMITS.get(gen_tier, 700))
+    why = _clip(why_text, _WHY_LIMIT)
     tags_raw = parsed.get("tags") or []
     tags = _canonical_tags(
         [str(t).strip() for t in tags_raw if str(t).strip()][:3], profile
@@ -373,9 +382,9 @@ async def _trend_intro(
         "the items below (title — source snippet).\n"
         "- SYNTHESIZE: name the through-line or tension connecting them — do NOT just "
         "enumerate. Lead with the single most important/striking finding.\n"
-        "- CITE A CONCRETE NUMBER or result when the snippets contain one (a benchmark "
-        "score, speedup, %, token/param count, $ figure). This is what separates "
-        "researcher-grade synthesis from an executive summary.\n"
+        "- You MAY cite a concrete number (benchmark, speedup, %, token/param count, $) "
+        "ONLY if it appears verbatim in a snippet above. NEVER invent or estimate a "
+        "number that is not in the snippets.\n"
         "- Plain, short, assertive sentences. BANNED phrases: 'various advances', "
         "'curators are focusing on', 'this digest', 'critical failure modes', and any "
         "marketing fluff or narration about what was selected.\n"
@@ -388,9 +397,11 @@ async def _trend_intro(
         json_schema=_TREND_SCHEMA,
         temperature=0.4,
     )
-    return _clip_to_sentence(
-        str(parse_json_obj(raw).get("summary") or "").strip().rstrip(" ,;"), 520
-    )
+    summary = str(parse_json_obj(raw).get("summary") or "").strip().rstrip(" ,;")
+    # GROUNDING: drop any sentence citing a number absent from the section's sources.
+    grounding = " ".join(source_digits(s, items_by_id) for s in stories[:14])
+    summary, _ = strip_ungrounded(summary, grounding)
+    return _clip_to_sentence(summary, 520)
 
 
 async def _top_stories_section(
