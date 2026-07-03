@@ -183,3 +183,18 @@ async def test_enrich_skips_single_community_story(llm) -> None:
     enriched = await enrich_stories(stories, {item.id: item}, llm=llm)
     # Single community story is not re-titled (no LLM call) => title unchanged.
     assert enriched[0].title == "solo"
+
+
+@pytest.mark.asyncio
+async def test_enrich_never_rewrites_titles(llm) -> None:
+    # A MULTI-SOURCE story must keep a REAL source title verbatim — never an
+    # LLM-invented headline (which once turned "not much happened today" into
+    # "AI News Summary Reports Minimal Industry Activity").
+    a = _item(0, source="smol.ai", family=Family.META, title="not much happened today",
+              vec_index=0)
+    b = _item(1, source="rss:latent-space", family=Family.META,
+              title="[AINews] not much happened today", vec_index=0)
+    stories = cluster_into_stories([a, b], threshold=0.5)
+    assert stories[0].mention_count == 2  # multi-source -> old code would re-title
+    enriched = await enrich_stories(stories, {a.id: a, b.id: b}, llm=llm)
+    assert enriched[0].title in {"not much happened today", "[AINews] not much happened today"}
