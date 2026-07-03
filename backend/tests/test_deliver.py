@@ -268,14 +268,27 @@ def test_html_escapes_untrusted_text() -> None:
 
 def test_email_build_payload_shape() -> None:
     payload = email_resend.build_payload(
-        subject="Daily", html="<p>hi</p>", to="me@example.com", from_email="d@example.com"
+        subject="Daily", html="<p>hi</p>", to="me@example.com", from_email="d@example.com",
+        text="hi (plain)",
     )
-    assert payload == {
-        "from": "d@example.com",
-        "to": ["me@example.com"],
-        "subject": "Daily",
-        "html": "<p>hi</p>",
-    }
+    assert payload["to"] == ["me@example.com"]
+    assert payload["subject"] == "Daily"
+    assert payload["html"] == "<p>hi</p>"
+    # Deliverability hardening: display-name From, plain-text part, unsubscribe header.
+    assert payload["from"] == "AI Digest <d@example.com>"
+    assert payload["text"] == "hi (plain)"
+    assert payload["reply_to"] == "d@example.com"
+    assert "List-Unsubscribe" in payload["headers"]
+
+
+def test_email_payload_derives_text_from_html() -> None:
+    # With no explicit text, a plain-text alternative is derived from the HTML.
+    payload = email_resend.build_payload(
+        subject="D", html="<h1>Title</h1><p>Body one.</p><p>Body two.</p>",
+        to="me@example.com", from_email="AI Digest <d@example.com>",
+    )
+    assert "Title" in payload["text"] and "<" not in payload["text"]
+    assert payload["from"] == "AI Digest <d@example.com>"  # existing display name preserved
 
 
 @pytest.mark.asyncio
@@ -397,12 +410,13 @@ async def test_send_email_posts_to_resend(monkeypatch: pytest.MonkeyPatch) -> No
     )
     assert ok is True
     assert _FakeClient.last_url == email_resend.RESEND_ENDPOINT
-    assert _FakeClient.last_json == {
-        "from": "digest@example.com",
-        "to": ["me@example.com"],
-        "subject": "Daily",
-        "html": "<p>hi</p>",
-    }
+    body = _FakeClient.last_json
+    assert body["from"] == "AI Digest <digest@example.com>"
+    assert body["to"] == ["me@example.com"]
+    assert body["subject"] == "Daily"
+    assert body["html"] == "<p>hi</p>"
+    assert body["text"]  # plain-text alternative present
+    assert "List-Unsubscribe" in body["headers"]
     assert _FakeClient.last_headers is not None
     assert _FakeClient.last_headers["Authorization"] == "Bearer re_test_key"
 
