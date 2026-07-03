@@ -180,8 +180,15 @@ async def _polish(
     return await llm.generate(messages, json_schema=_CANDIDATE_SCHEMA, temperature=0.3)
 
 
-def _parse_entries(raw_list: object) -> list[WeeklyShortlistEntry]:
-    """Build WeeklyShortlistEntry list from parsed JSON, skipping bad rows."""
+def _parse_entries(
+    raw_list: object, valid_urls: frozenset[str] = frozenset()
+) -> list[WeeklyShortlistEntry]:
+    """Build WeeklyShortlistEntry list from parsed JSON, skipping bad rows.
+
+    GROUNDING: a shortlist URL is kept only if it is a REAL story link (present in
+    ``valid_urls``); an invented/mis-attributed URL is nulled so we never link the
+    reader to a fabricated source. Empty ``valid_urls`` disables the check.
+    """
     entries: list[WeeklyShortlistEntry] = []
     if not isinstance(raw_list, list):
         return entries
@@ -192,12 +199,11 @@ def _parse_entries(raw_list: object) -> list[WeeklyShortlistEntry]:
         if not title:
             continue
         family = _coerce_family(row.get("family"))
-        url = row.get("url")
+        raw_url = str(row.get("url") or "").strip() or None
+        url = raw_url if (raw_url and (not valid_urls or raw_url in valid_urls)) else None
         entries.append(
             WeeklyShortlistEntry(
-                title=title,
-                url=str(url).strip() if url else None,
-                one_liner=str(row.get("one_liner") or "").strip(),
+                title=title, url=url, one_liner=str(row.get("one_liner") or "").strip(),
                 family=family,
             )
         )
@@ -282,6 +288,11 @@ async def generate_weekly(
     if quiet_week and not body:
         body = "Quiet week — nothing major shipped."
 
+    # GROUNDING: only allow shortlist/radar links that point at a REAL story source.
+    valid_urls = frozenset(
+        it.url for it in items_by_id.values() if it.url
+    )
+
     return WeeklyDigest(
         id=_iso_week_id(week_of),
         kind=DigestKind.WEEKLY,
@@ -291,8 +302,8 @@ async def generate_weekly(
         body_markdown=body,
         overall_tier=overall_tier,
         quiet_week=quiet_week,
-        shortlist=_parse_entries(parsed.get("shortlist")),
-        on_my_radar=_parse_entries(parsed.get("on_my_radar")),
+        shortlist=_parse_entries(parsed.get("shortlist"), valid_urls),
+        on_my_radar=_parse_entries(parsed.get("on_my_radar"), valid_urls),
         story_ids=[s.id for s in tagged],
         candidate_count=n,
         winning_candidate=winner_idx,
