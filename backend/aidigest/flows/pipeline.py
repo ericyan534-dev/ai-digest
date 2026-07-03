@@ -372,7 +372,9 @@ async def _deliver_daily(digest: DailyDigest) -> None:
             api_base=settings.public_base_url,
             link_secret=settings.feedback_link_secret,
         )
-        emailed = await send_email(subject=f"AI Digest — {digest.date}", html=html)
+        emailed = await send_email(
+            subject=f"AI Digest — {digest.date}", html=html, text=render_daily_md(digest)
+        )
         telegrammed = await tg_send_daily(digest)
         wiki_dir = get_settings().wiki_dir
         wiki_n = len(wiki_export_daily(digest, wiki_dir=wiki_dir)) if wiki_dir else 0
@@ -443,7 +445,11 @@ def _week_dates(week_of: str) -> list[str]:
 async def _deliver_weekly(digest: WeeklyDigest) -> None:
     async with step("deliver_weekly") as s:
         html = render_weekly_html(digest)
-        emailed = await send_email(subject=digest.title or "AI Digest — Week", html=html)
+        emailed = await send_email(
+            subject=digest.title or "AI Digest — Week",
+            html=html,
+            text=digest.body_markdown or None,
+        )
         wiki_dir = get_settings().wiki_dir
         wiki_n = (
             len(
