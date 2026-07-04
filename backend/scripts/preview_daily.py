@@ -83,11 +83,11 @@ async def _run(hours: int, per_source: int, deliver: bool) -> None:
     stories = score_stories(stories, interest_vector=interest, profile=profile)
     before = len(stories)
     stories = await curate_stories(stories, profile=profile, llm=llm)
-    stories = apply_announcement_floor(stories)  # real announcements register as notable
+    items_by_id = {it.id: it for it in items}
+    stories = apply_announcement_floor(stories, items_by_id)  # real announcements register as notable
     print(f"# curated: {before} -> {len(stories)} worthy stories  ({_family_counts(stories)})", file=sys.stderr)
     stories, _overall, quiet = classify_day(stories, profile=profile)
 
-    items_by_id = {it.id: it for it in items}
     date = datetime.now(ZoneInfo(settings.timezone)).date().isoformat()
     # generate_daily does the balanced per-family selection (academia/industry/community).
     digest = await generate_daily(stories, items_by_id, profile=profile, date=date, llm=llm)

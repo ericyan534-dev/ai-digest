@@ -42,6 +42,7 @@ from aidigest.personalize.feedback import (
     recompute_interest_vector,
 )
 from aidigest.personalize.profile import load_profile
+from aidigest.process._signals import is_aggregator_item
 from aidigest.process.cluster import cluster_into_stories
 from aidigest.process.curate import curate_stories
 from aidigest.process.embed import embed_items
@@ -79,8 +80,17 @@ def balanced_pool(items: list[Item], *, per_source: int = DAILY_ITEM_PER_SOURCE_
     Bounds the O(n^3) clustering pool and stops a high-volume source (arXiv, HN) from
     crowding academia/industry out. Shared by run_process and scripts.preview_daily so
     the automation and the offline preview cluster the SAME bounded set.
+
+    Aggregator items (smol.ai source, Latent Space AINews mirror URLs) are silently
+    removed before capping. They are still ingested and stored, but must not enter the
+    story pool: including them inflates mention_count (fake-corroboration) and can turn
+    a quiet day into a falsely busy one.
     """
     from collections import defaultdict
+
+    # Drop meta-aggregator items before any per-source cap is applied so both
+    # run_process and preview_daily get the filter automatically.
+    items = [it for it in items if not is_aggregator_item(it)]
 
     by_src: dict[str, list[Item]] = defaultdict(list)
     for it in sorted(items, key=lambda x: x.published_at, reverse=True):
@@ -177,13 +187,13 @@ async def run_process(*, since: datetime | None = None) -> int:
     stories = await _rank_stories(repo, llm, profile, stories, items, window_since)
 
     async with step("curate") as s:
+        items_by_id = {it.id: it for it in items}
         kept = await curate_stories(stories, profile=profile, llm=llm)  # type: ignore[arg-type]
-        kept = apply_announcement_floor(kept)  # real announcements register as notable
+        kept = apply_announcement_floor(kept, items_by_id)  # real announcements register as notable
         s.set(before=len(stories), after=len(kept))
         stories = kept
 
     async with step("enrich") as s:
-        items_by_id = {it.id: it for it in items}
         stories = await enrich_stories(stories, items_by_id, llm=llm)
         s.set(stories=len(stories))
 
@@ -326,6 +336,10 @@ async def run_daily(*, date: str | None = None, deliver: bool = False) -> DailyD
     async with step("classify_day") as s:
         stories, overall_tier, quiet = classify_day(stories, profile=profile)
         s.set(stories=len(stories), tier=overall_tier.value, quiet=quiet)
+
+    async with step("persist_tiers") as s:
+        n = await repo.upsert_stories(stories)
+        s.set(stories=n)
 
     async with step("generate_daily") as s:
         digest = await generate_daily(

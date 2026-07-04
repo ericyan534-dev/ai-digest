@@ -130,6 +130,142 @@ async def test_curate_parse_failure_keeps_all(monkeypatch: pytest.MonkeyPatch) -
     assert await curate_stories(stories, profile={}, llm=_Bad()) == stories
 
 
+# --------------------------------------------------------------------------- #
+# Fix A Layer 2 — _is_meta_recap deterministic hard-drop
+# --------------------------------------------------------------------------- #
+
+
+def test_is_meta_recap_not_much_happened() -> None:
+    """Classic quiet-day recap phrase is always dropped regardless of mention_count."""
+    from aidigest.process.curate import _is_meta_recap
+
+    s = _story(1, "not much happened today").model_copy(update={"mention_count": 2})
+    assert _is_meta_recap(s) is True
+
+
+def test_is_meta_recap_nothing_much_happened() -> None:
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "Nothing much happened this week")) is True
+
+
+def test_is_meta_recap_quiet_day() -> None:
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "Quiet day in AI land")) is True
+
+
+def test_is_meta_recap_quiet_weekend() -> None:
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "Quiet Weekend — no big launches")) is True
+
+
+def test_is_meta_recap_slow_news() -> None:
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "Slow news day for AI")) is True
+
+
+def test_is_meta_recap_ainews_headline() -> None:
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "AINews: week in review")) is True
+
+
+def test_is_meta_recap_weekly_recap() -> None:
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "Weekly Recap: best of AI")) is True
+
+
+def test_is_meta_recap_weekly_roundup() -> None:
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "The Weekly Roundup for AI researchers")) is True
+
+
+def test_is_meta_recap_week_in_review() -> None:
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "Week in Review: LLMs dominate")) is True
+
+
+def test_is_meta_recap_top_ai_news() -> None:
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "Top AI News of the week")) is True
+
+
+def test_is_meta_recap_news_roundup() -> None:
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "News Roundup: AI edition")) is True
+
+
+def test_is_meta_recap_daily_digest() -> None:
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "Daily Digest: June 21")) is True
+
+
+def test_is_meta_recap_daily_recap() -> None:
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "Daily Recap — what you missed")) is True
+
+
+# Adversarial near-misses that must NOT be dropped
+
+
+def test_is_meta_recap_quiet_star_not_dropped() -> None:
+    """'Quiet-STaR' starts with 'Quiet' but has no 'quiet day/week' phrase."""
+    from aidigest.process.curate import _is_meta_recap
+
+    s = _story(1, "Quiet-STaR: Language Models Can Teach Themselves to Think")
+    assert _is_meta_recap(s) is False
+
+
+def test_is_meta_recap_real_paper_not_dropped() -> None:
+    """A real paper title containing 'news' must not false-positive."""
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "Breaking News Detection with Neural Networks")) is False
+
+
+def test_is_meta_recap_release_not_dropped() -> None:
+    """A concrete model release announcement is never dropped."""
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "OpenAI announces GPT-5.6 Sol")) is False
+
+
+def test_is_meta_recap_dropped_regardless_of_mention_count() -> None:
+    """Unlike self-promo, recap headlines are dropped EVEN when corroborated."""
+    from aidigest.process.curate import _is_meta_recap
+
+    # corroborated across 5 sources — still a recap
+    s = _story(1, "AINews: Top AI Stories this week").model_copy(update={"mention_count": 5})
+    assert _is_meta_recap(s) is True
+
+
+@pytest.mark.asyncio
+async def test_curate_drops_meta_recap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """curate_stories deterministic pass drops meta-recap even before the LLM."""
+    monkeypatch.setattr(curate, "get_settings", _live)
+    stories = [
+        _story(1, "OpenAI releases GPT-5.6 Sol", Family.INDUSTRY),
+        _story(2, "AINews: Week in Review").model_copy(update={"mention_count": 3}),
+    ]
+    # LLM would keep both (n=1 and n=2), but the recap must be pre-filtered.
+    out = await curate_stories(
+        stories, profile={}, llm=_FakeLLM([{"n": 1, "family": "industry"}, {"n": 2, "family": "meta"}])
+    )
+    titles = [s.title for s in out]
+    assert "AINews: Week in Review" not in titles
+    assert "OpenAI releases GPT-5.6 Sol" in titles
+
+
 @pytest.mark.asyncio
 async def test_curate_malformed_output_keeps_all(monkeypatch: pytest.MonkeyPatch) -> None:
     # The model occasionally concatenates every number into one giant out-of-range
@@ -145,3 +281,22 @@ async def test_curate_malformed_output_keeps_all(monkeypatch: pytest.MonkeyPatch
     stories = [_story(1, "a"), _story(2, "b"), _story(3, "c")]
     out = await curate_stories(stories, profile={}, llm=_Concat())
     assert out == stories  # never nuked to empty
+
+
+# --------------------------------------------------------------------------- #
+# Fix 1 — ainews separator tightening (code-review round)
+# --------------------------------------------------------------------------- #
+
+
+def test_is_meta_recap_ainews_with_separator_dropped() -> None:
+    """'AINews:' recap form (with separator) is still dropped."""
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "AINews: not much happened today")) is True
+
+
+def test_is_meta_recap_ainews_without_separator_not_dropped() -> None:
+    """A story ABOUT AINews (no separator) must NOT be dropped."""
+    from aidigest.process.curate import _is_meta_recap
+
+    assert _is_meta_recap(_story(1, "AINews raises $5M to expand coverage")) is False

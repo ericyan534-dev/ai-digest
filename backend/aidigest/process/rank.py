@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from aidigest.models import Family, Story
+from aidigest.models import Family, Item, Story
 from aidigest.process._signals import is_release_title
 from aidigest.process._vec import cosine as _cosine
 
@@ -96,27 +96,57 @@ def importance_score(story: Story, *, profile: dict) -> float:
 
 
 # A confirmed announcement is NEWS even with zero upvotes — a lab blog post has no
-# engagement signal, yet "Anthropic signs a state government" is a notable day. Floor
+# engagement signal, yet "Anthropic releases a new model" is a notable day. Floor
 # such stories into the NOTABLE band so real announcements lift the day above "quiet"
 # and can lead — WITHOUT reaching the breakthrough bar (that still needs real
 # attention). Kept below breakthrough_importance_override (0.55) by construction.
 _ANNOUNCEMENT_IMPORTANCE_FLOOR = 0.42
 
+# Minimum total raw_text length across a story's items to treat it as a substantive
+# announcement (not a bare headline).  Mirrors _MIN_SOURCE_CHARS in generate/_grounding.
+_FLOOR_MIN_SOURCE_CHARS = 200
 
-def apply_announcement_floor(stories: list[Story]) -> list[Story]:
-    """Raise importance for confirmed announcements to the NOTABLE floor (post-curation).
 
-    Applied AFTER the curator has assigned the TOPIC family, so an INDUSTRY story (a
-    real model/product/funding/policy announcement) or any explicit release-titled
-    story registers as notable even though a press release carries no upvotes. This is
-    the counterpart to the substance gate: virality must not INFLATE a meme, and a real
-    announcement must not be INVISIBLE. Never raises a story to the breakthrough bar.
+def _source_len(story: Story, items_by_id: dict[str, Item]) -> int:
+    """Total raw_text chars across a story's member items."""
+    return sum(
+        len((items_by_id[iid].raw_text or "").strip())
+        for iid in story.item_ids
+        if iid in items_by_id
+    )
+
+
+def apply_announcement_floor(
+    stories: list[Story], items_by_id: dict[str, Item]
+) -> list[Story]:
+    """Raise importance for substantive release announcements to the NOTABLE floor.
+
+    Precision rationale: the old heuristic floored ALL INDUSTRY stories, including
+    uncorroborated headline-only blips like "Acme AI announces product". Those blips
+    are often cross-linked by smol.ai (fake-corroboration) but carry no real signal,
+    so flooring them was masking quiet days as busy.
+
+    A story is floored ONLY when ALL of the following hold:
+      1. its title reads as a concrete release/announcement (is_release_title),
+      2. AND it has genuine corroboration OR substantive body text:
+           • mention_count >= 2 (picked up independently by multiple sources), OR
+           • total raw_text across member items >= 200 chars (a real write-up exists).
+
+    INDUSTRY family alone NO LONGER triggers the floor.  A brief press-release
+    title with a single mention and no body is a headline blip; it must not lift the
+    day's importance above the quiet-day gate.
     """
     out: list[Story] = []
     for s in stories:
-        is_announcement = s.family == Family.INDUSTRY or is_release_title(s.title)
-        if is_announcement and s.importance < _ANNOUNCEMENT_IMPORTANCE_FLOOR:
-            out.append(s.model_copy(update={"importance": _ANNOUNCEMENT_IMPORTANCE_FLOOR}))
+        if is_release_title(s.title) and (
+            s.mention_count >= 2 or _source_len(s, items_by_id) >= _FLOOR_MIN_SOURCE_CHARS
+        ):
+            if s.importance < _ANNOUNCEMENT_IMPORTANCE_FLOOR:
+                out.append(
+                    s.model_copy(update={"importance": _ANNOUNCEMENT_IMPORTANCE_FLOOR})
+                )
+            else:
+                out.append(s)
         else:
             out.append(s)
     return out
