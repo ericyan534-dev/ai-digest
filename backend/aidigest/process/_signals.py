@@ -13,20 +13,71 @@ from datetime import UTC, datetime
 
 from aidigest.models import Family, Item
 
+# --------------------------------------------------------------------------- #
+# Aggregator source detection
+# --------------------------------------------------------------------------- #
+
+# Sources that are meta-aggregators: items are ingested for completeness but must
+# NOT enter the story pool (they fake-corroborate every story they link, inflating
+# mention_count and distorting the quiet-day gate).
+_AGGREGATOR_SOURCES: frozenset[str] = frozenset({"smol.ai"})
+
+# URLs matching the Latent Space AINews mirror pattern.
+# e.g. https://www.latent.space/p/ainews-2026-06-21
+_AGGREGATOR_URL_RE: re.Pattern[str] = re.compile(
+    r"latent\.space/p/ainews-", re.IGNORECASE
+)
+
+
+def is_aggregator_item(item: Item) -> bool:
+    """True when an item comes from a known meta-aggregator source or URL.
+
+    Items from smol.ai or Latent Space AINews mirror URLs are always excluded from
+    the story pool: they aggregate other sources, so including them inflates
+    mention_count and can make any quiet day look busy.
+    """
+    if item.source in _AGGREGATOR_SOURCES:
+        return True
+    if item.url and _AGGREGATOR_URL_RE.search(item.url):
+        return True
+    return False
+
 # A concrete release / announcement (a real model/product/result shipping) — the
 # kind of title that legitimizes a high-engagement single-source story as genuinely
 # important. A viral anecdote/drama title ("my resume scored 90/100", "second
 # opinion on my MRI") matches NONE of these. Mirrors generate.daily._ANNOUNCE_RE.
+# "rolls out" / "rolling out" added for gradual rollout announcements.
+# "drops" is intentionally EXCLUDED: too many false positives ("Nvidia stock drops",
+# "accuracy drops").
 _RELEASE_TITLE_RE = re.compile(
     r"\b(unveils?|introduc\w+|releas\w+|launch\w+|announc\w+|ships?|debuts?|"
-    r"open[- ]?sourc\w+|presents?|now available)\b",
+    r"open[- ]?sourc\w+|presents?|now available|rolls?\s+out|rolling\s+out)\b",
+    re.IGNORECASE,
+)
+
+# Corroborable deal / funding news — raises $X, acquires, partners with, etc.
+# "raises" requires a $ amount to avoid "raises questions" false positives.
+# "invests" similarly requires a $ amount.
+_DEAL_TITLE_RE = re.compile(
+    r"\braises?\s+\$"
+    r"|\bacquires?\b"
+    r"|\bacquisition\s+of\b"
+    r"|\bpartners?\s+with\b"
+    r"|\bsigns?\s+(?:a\s+|an\s+)?deal\b"
+    r"|\binvests?\s+\$",
     re.IGNORECASE,
 )
 
 
 def is_release_title(title: str) -> bool:
-    """True when a title reads as a concrete release/announcement (not an anecdote)."""
-    return bool(_RELEASE_TITLE_RE.search(title or ""))
+    """True when a title reads as a concrete release/announcement or corroborable
+    deal news (funding, acquisition, partnership).
+
+    Intentional exclusions: "drops" (false positives: "stock drops", "accuracy
+    drops"); bare "raises" without a $ amount ("raises questions").
+    """
+    t = title or ""
+    return bool(_RELEASE_TITLE_RE.search(t)) or bool(_DEAL_TITLE_RE.search(t))
 
 # Default per-family source authority (overridable via profile family_weights).
 _FAMILY_AUTHORITY: dict[Family, float] = {
@@ -37,12 +88,13 @@ _FAMILY_AUTHORITY: dict[Family, float] = {
 }
 
 # Known high-authority sources get a small bump regardless of family.
+# smol.ai is intentionally absent: aggregator items are excluded from the pool
+# upstream (is_aggregator_item) and never reach authority().
 _SOURCE_AUTHORITY: dict[str, float] = {
     "arxiv": 0.85,
     "openreview": 0.9,
     "semantic_scholar": 0.85,
     "hf_papers": 0.8,
-    "smol.ai": 0.8,
     "hn": 0.65,
     "reddit": 0.55,
 }
@@ -131,4 +183,5 @@ __all__ = [
     "age_days",
     "representative_score",
     "is_release_title",
+    "is_aggregator_item",
 ]

@@ -84,6 +84,31 @@ def _parse_keep(raw: str, *, n: int) -> list[tuple[int, str | None]] | None:
     return out
 
 
+# Meta-digest / recap headlines that carry zero new signal regardless of how many
+# sources linked them (smol.ai-style aggregators fake-corroborate their own recaps).
+# Word-boundary anchored so "Quiet-STaR: Language Models Can Think" never fires.
+_RECAP_RE: re.Pattern[str] = re.compile(
+    # Word-bounded recap patterns (all end on a word character).
+    r"\b(?:not much happened|nothing much happened|quiet day|quiet week(?:end)?"
+    r"|slow news|weekly (?:recap|roundup)|week in review"
+    r"|top ai (?:news|stories)|news roundup|daily (?:digest|recap))\b"
+    # "AINews:" / "AINews—" / "AINews-" mirror-recap form only — NOT bare "ainews"
+    # so stories ABOUT AINews (e.g. "AINews raises $5M") are never dropped.
+    r"|\bainews\s*[:—\-]",
+    re.IGNORECASE,
+)
+
+
+def _is_meta_recap(story: Story) -> bool:
+    """True when a story headline is a meta-digest / recap summary (always drop).
+
+    Unlike self-promo and viral-noise filters, NO single-source gate is applied:
+    a recap picked up by many sources is still a recap. Aggregators cross-link
+    their own roundups, making mention_count unreliable for this class.
+    """
+    return bool(_RECAP_RE.search(story.title or ""))
+
+
 # Self-promo framings the reader explicitly does NOT want (when single-source).
 _SELF_PROMO_PREFIXES: tuple[str, ...] = ("show hn:", "tell hn:", "ask hn:")
 
@@ -136,8 +161,15 @@ async def curate_stories(
     settings = get_settings()
     if settings.llm_mock or not getattr(settings, "relevance_filter", True):
         return stories
-    # Hard pre-filter the explicit self-promo + viral-anecdote noise before the LLM.
-    stories = [s for s in stories if not _is_self_promo(s) and not _is_low_signal_noise(s)]
+    # Hard pre-filter the explicit self-promo + viral-anecdote noise + meta-recap
+    # headlines before the LLM. Meta-recap is gated independently (no mention_count
+    # condition) because aggregators fake-corroborate their own roundups.
+    stories = [
+        s for s in stories
+        if not _is_self_promo(s)
+        and not _is_low_signal_noise(s)
+        and not _is_meta_recap(s)
+    ]
     if len(stories) <= 1:
         return stories
 

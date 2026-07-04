@@ -62,6 +62,7 @@ class FakeRepo:
         self.feedback: list[Feedback] = []
         self.evals: list[dict] = []
         self.state: dict[str, dict] = {}
+        self.upsert_stories_calls: list[list[Story]] = []
 
     async def init_schema(self) -> None:  # pragma: no cover - unused here
         return None
@@ -84,6 +85,7 @@ class FakeRepo:
         return [self.items[i] for i in ids if i in self.items]
 
     async def upsert_stories(self, stories: list[Story]) -> int:
+        self.upsert_stories_calls.append(list(stories))
         for st in stories:
             self.stories[st.id] = st
         return len(stories)
@@ -244,3 +246,147 @@ def test_week_of_iso_is_monday() -> None:
 
 def test_weekly_id_format() -> None:
     assert pipeline._weekly_id("2026-06-15") == "weekly-2026-W25"
+
+
+# --------------------------------------------------------------------------- #
+# Fix A — aggregator exclusion
+# --------------------------------------------------------------------------- #
+
+
+def test_is_aggregator_item_smolai_source() -> None:
+    """Items from smol.ai (the aggregator source) must be flagged."""
+    from aidigest.process._signals import is_aggregator_item
+
+    item = Item.create(
+        source="smol.ai",
+        family=Family.META,
+        title="AINews: big week for AI",
+        url="https://smol.ai/news/2026-06-21",
+        published_at=NOW,
+    )
+    assert is_aggregator_item(item) is True
+
+
+def test_is_aggregator_item_ainews_url() -> None:
+    """Items whose URL is a Latent Space AINews mirror are flagged."""
+    from aidigest.process._signals import is_aggregator_item
+
+    item = Item.create(
+        source="hn",
+        family=Family.COMMUNITY,
+        title="AINews: everything that happened this week",
+        url="https://www.latent.space/p/ainews-june2026",
+        published_at=NOW,
+    )
+    assert is_aggregator_item(item) is True
+
+
+def test_is_aggregator_item_ainews_url_case_insensitive() -> None:
+    """AINews mirror URL match is case-insensitive."""
+    from aidigest.process._signals import is_aggregator_item
+
+    item = Item.create(
+        source="rss:latent.space",
+        family=Family.META,
+        title="AINews: week in review",
+        url="https://www.latent.space/p/AINews-2026-06-21",
+        published_at=NOW,
+    )
+    assert is_aggregator_item(item) is True
+
+
+def test_is_aggregator_item_normal_latent_space_post() -> None:
+    """A normal Latent Space interview/essay is NOT flagged as an aggregator."""
+    from aidigest.process._signals import is_aggregator_item
+
+    item = Item.create(
+        source="rss:latent.space",
+        family=Family.COMMUNITY,
+        title="The state of AI inference",
+        url="https://www.latent.space/p/the-ai-timeline-problem",
+        published_at=NOW,
+    )
+    assert is_aggregator_item(item) is False
+
+
+def test_is_aggregator_item_techcrunch() -> None:
+    """A normal TechCrunch item is not an aggregator."""
+    from aidigest.process._signals import is_aggregator_item
+
+    item = Item.create(
+        source="rss:techcrunch",
+        family=Family.INDUSTRY,
+        title="OpenAI raises $10B",
+        url="https://techcrunch.com/2026/06/21/openai-raises",
+        published_at=NOW,
+    )
+    assert is_aggregator_item(item) is False
+
+
+def test_balanced_pool_excludes_aggregator_items() -> None:
+    """balanced_pool must silently drop smol.ai and AINews-URL items before capping."""
+    base = datetime.now(UTC)
+
+    smol = Item.create(
+        source="smol.ai",
+        family=Family.META,
+        title="AINews daily",
+        url="https://smol.ai/news/today",
+        published_at=base,
+    )
+    ainews = Item.create(
+        source="rss:latent.space",
+        family=Family.META,
+        title="AINews: Latent Space edition",
+        url="https://latent.space/p/ainews-june21",
+        published_at=base,
+    )
+    normal = Item.create(
+        source="arxiv",
+        family=Family.ACADEMIA,
+        title="Efficient long-context transformers",
+        url="https://arxiv.org/abs/2606.00999",
+        published_at=base,
+    )
+
+    pooled = pipeline.balanced_pool([smol, ainews, normal], per_source=20)
+    ids = {it.id for it in pooled}
+    assert smol.id not in ids, "smol.ai item must be excluded from pool"
+    assert ainews.id not in ids, "AINews mirror item must be excluded from pool"
+    assert normal.id in ids, "normal arxiv item must remain in pool"
+
+
+# --------------------------------------------------------------------------- #
+# Scope addition — persist classified tiers
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_run_daily_persists_classified_tiers(wired: FakeRepo) -> None:
+    """run_daily must upsert stories a second time after classify_day so that
+    post-classification tiers (not the default MINOR) are canonical in the DB.
+    When the day is notable, at least one persisted story must have a non-MINOR tier.
+    """
+    from aidigest.models import ImportanceTier
+
+    await pipeline.run_ingest()
+
+    wired.upsert_stories_calls.clear()  # ignore any calls made by run_process
+
+    await pipeline.run_daily(date="2026-06-21")
+
+    # There must be at least two upsert_stories calls after run_process:
+    # one from run_process (stories built), one from run_daily post-classify_day.
+    assert len(wired.upsert_stories_calls) >= 2, (
+        "run_daily must call upsert_stories at least once after classify_day "
+        "(in addition to the run_process upsert)"
+    )
+
+    # The last upsert_stories call must contain at least one story whose tier
+    # is not the default MINOR — i.e. classification was actually persisted.
+    last_call_stories = wired.upsert_stories_calls[-1]
+    tiers = {st.tier for st in last_call_stories}
+    assert tiers - {ImportanceTier.MINOR}, (
+        "The post-classify_day upsert must include at least one non-MINOR tier; "
+        f"got tiers={tiers!r}"
+    )

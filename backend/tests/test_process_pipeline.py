@@ -198,3 +198,82 @@ async def test_enrich_never_rewrites_titles(llm) -> None:
     assert stories[0].mention_count == 2  # multi-source -> old code would re-title
     enriched = await enrich_stories(stories, {a.id: a, b.id: b}, llm=llm)
     assert enriched[0].title in {"not much happened today", "[AINews] not much happened today"}
+
+
+# --------------------------------------------------------------------------- #
+# Fix 2 — is_release_title: "rolls out" / "rolling out" verbs
+# --------------------------------------------------------------------------- #
+
+
+def test_is_release_title_rolls_out() -> None:
+    from aidigest.process._signals import is_release_title
+
+    assert is_release_title("OpenAI rolls out GPT-5o to all users") is True
+
+
+def test_is_release_title_rolling_out() -> None:
+    from aidigest.process._signals import is_release_title
+
+    assert is_release_title("Anthropic is rolling out Claude 4 to enterprise") is True
+
+
+def test_is_release_title_drops_not_a_release() -> None:
+    """'drops' must NOT be treated as a release verb (too many false positives)."""
+    from aidigest.process._signals import is_release_title
+
+    assert is_release_title("Nvidia stock drops 10% after earnings miss") is False
+
+
+# --------------------------------------------------------------------------- #
+# Fix 3 — is_release_title: deal / funding patterns
+# --------------------------------------------------------------------------- #
+
+
+def test_is_release_title_raises_with_amount() -> None:
+    from aidigest.process._signals import is_release_title
+
+    assert is_release_title("Anthropic raises $4B from Google") is True
+
+
+def test_is_release_title_raises_without_amount_not_flagged() -> None:
+    """'raises' without a $ amount must NOT be treated as a deal headline."""
+    from aidigest.process._signals import is_release_title
+
+    assert is_release_title("Study raises questions about LLM evals") is False
+
+
+def test_is_release_title_accuracy_drops_not_flagged() -> None:
+    """'drops' in a metrics context must not be a false positive."""
+    from aidigest.process._signals import is_release_title
+
+    assert is_release_title("Ask HN: why did my accuracy drop after fine-tuning") is False
+
+
+def test_is_release_title_acquires() -> None:
+    from aidigest.process._signals import is_release_title
+
+    assert is_release_title("Google acquires AI startup for $500M") is True
+
+
+def test_is_release_title_acquisition_of() -> None:
+    from aidigest.process._signals import is_release_title
+
+    assert is_release_title("Meta completes acquisition of Scale AI") is True
+
+
+def test_is_release_title_partners_with() -> None:
+    from aidigest.process._signals import is_release_title
+
+    assert is_release_title("OpenAI partners with Palantir for government AI") is True
+
+
+def test_is_release_title_signs_deal() -> None:
+    from aidigest.process._signals import is_release_title
+
+    assert is_release_title("Mistral signs a deal with Microsoft Azure") is True
+
+
+def test_is_release_title_invests_with_amount() -> None:
+    from aidigest.process._signals import is_release_title
+
+    assert is_release_title("SoftBank invests $3B in OpenAI's next round") is True
