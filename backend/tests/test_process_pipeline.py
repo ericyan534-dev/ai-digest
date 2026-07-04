@@ -277,3 +277,96 @@ def test_is_release_title_invests_with_amount() -> None:
     from aidigest.process._signals import is_release_title
 
     assert is_release_title("SoftBank invests $3B in OpenAI's next round") is True
+
+
+# --------------------------------------------------------------------------- #
+# Fix: cross-family academia/community cannot-link (2026-07-03 bug)
+# An HF-papers ACADEMIA item and a Reddit COMMUNITY post about a DIFFERENT paper
+# must never cluster together even when their embeddings happen to be similar.
+# --------------------------------------------------------------------------- #
+
+
+def test_cannot_link_blocks_academia_reddit_different_paper() -> None:
+    """Regression for 2026-07-03 digest: 'Multi-Resolution Flow Matching' story
+    showed a Reddit link pointing at the unrelated 'BlockPilot' paper because
+    similar topic embeddings caused two distinct items to cluster.
+
+    _cannot_link must return True for this cross-family, different-paper pair.
+    """
+    from aidigest.process.cluster import _cannot_link  # noqa: PLC2701
+    from tests.conftest import unit_basis_vector  # type: ignore
+
+    hf = Item.create(
+        source="hf-papers",
+        family=Family.ACADEMIA,
+        title="Multi-Resolution Flow Matching: Training-Free Diffusion Acceleration via Staged Sampling",
+        url="https://huggingface.co/papers/2607.01642",
+        published_at=NOW,
+    ).with_embedding(unit_basis_vector(0))
+
+    reddit = Item.create(
+        source="reddit-localllama",
+        family=Family.COMMUNITY,
+        title="BlockPilot: Instance-Adaptive Policy Learning for Efficient Block-Sparse Attention",
+        url="https://www.reddit.com/r/LocalLLaMA/comments/1umgb79/blockpilot_instanceadaptive_policy_learning_for/",
+        published_at=NOW,
+    ).with_embedding(unit_basis_vector(0))  # identical vector — would merge without fix
+
+    assert _cannot_link(hf, reddit) is True
+    assert _cannot_link(reddit, hf) is True  # symmetric
+
+
+def test_cluster_academia_reddit_different_paper_stays_separate() -> None:
+    """Two distinct papers — one from HF-papers, one a Reddit thread — must produce
+    two separate stories even when their embeddings are identical (threshold=0.5)."""
+    from tests.conftest import unit_basis_vector  # type: ignore
+
+    hf = Item.create(
+        source="hf-papers",
+        family=Family.ACADEMIA,
+        title="Multi-Resolution Flow Matching: Training-Free Diffusion Acceleration via Staged Sampling",
+        url="https://huggingface.co/papers/2607.01642",
+        published_at=NOW,
+    ).with_embedding(unit_basis_vector(0))
+
+    reddit = Item.create(
+        source="reddit-localllama",
+        family=Family.COMMUNITY,
+        title="BlockPilot: Instance-Adaptive Policy Learning for Efficient Block-Sparse Attention",
+        url="https://www.reddit.com/r/LocalLLaMA/comments/1umgb79/blockpilot_instanceadaptive_policy_learning_for/",
+        published_at=NOW,
+    ).with_embedding(unit_basis_vector(0))
+
+    stories = cluster_into_stories([hf, reddit], threshold=0.5)
+    assert len(stories) == 2, (
+        "Distinct papers must not be merged: story titles were "
+        + str([s.title for s in stories])
+    )
+
+
+def test_cluster_academia_reddit_same_paper_may_merge() -> None:
+    """A Reddit thread whose title clearly discusses the SAME HF paper must still be
+    allowed to cluster with it — the fix must not over-block valid cross-source merges."""
+    from aidigest.process.cluster import _cannot_link  # noqa: PLC2701
+    from tests.conftest import unit_basis_vector  # type: ignore
+
+    hf = Item.create(
+        source="hf-papers",
+        family=Family.ACADEMIA,
+        title="Multi-Resolution Flow Matching: Training-Free Diffusion Acceleration via Staged Sampling",
+        url="https://huggingface.co/papers/2607.01642",
+        published_at=NOW,
+    ).with_embedding(unit_basis_vector(0))
+
+    reddit = Item.create(
+        source="reddit-localllama",
+        family=Family.COMMUNITY,
+        title="Multi-Resolution Flow Matching - Training-Free Diffusion paper discussion",
+        url="https://www.reddit.com/r/MachineLearning/comments/abc123/multi_resolution_flow_matching/",
+        published_at=NOW,
+    ).with_embedding(unit_basis_vector(0))
+
+    # Title Jaccard ≈ 0.58 >> _PAPER_TITLE_OVERLAP_MIN → NOT cannot-link.
+    assert _cannot_link(hf, reddit) is False
+    stories = cluster_into_stories([hf, reddit], threshold=0.5)
+    assert len(stories) == 1, "Same-paper cross-source pair should still cluster"
