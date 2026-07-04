@@ -62,6 +62,44 @@ def _url_path(url: str | None) -> str | None:
     return path or s
 
 
+# Minimum Jaccard overlap of title tokens required for a cross-family pair that
+# includes an ACADEMIA item to be considered "the same story". AI-topic embeddings
+# are too compressed: a Reddit post about "BlockPilot" and an HF-papers entry for
+# "Multi-Resolution Flow Matching" can both sit above the cluster threshold because
+# both describe diffusion/attention efficiency work. Title overlap is a cheap,
+# reliable secondary discriminator — the same paper mentioned in two sources will
+# share most of its title words; two different papers almost never will.
+_PAPER_TITLE_OVERLAP_MIN: float = 0.15
+
+
+def _title_tokens(title: str) -> frozenset[str]:
+    """Lowercase alphabetic tokens of length >= 3, minus common prepositions.
+
+    Returns frozenset so callers can cheaply compute intersection/union.
+    """
+    _STOP = frozenset(
+        {"the", "and", "for", "with", "via", "from", "this", "that", "are", "its"}
+    )
+    return frozenset(
+        w
+        for w in (t.lower() for t in re.findall(r"[A-Za-z]{3,}", title or ""))
+        if w not in _STOP
+    )
+
+
+def _title_jaccard(a: Item, b: Item) -> float:
+    """Jaccard coefficient on title tokens in [0, 1].
+
+    Returns 0.0 when either item has an empty token set (too-short title to
+    discriminate), so the cannot-link guard is not applied in that case.
+    """
+    ta = _title_tokens(a.title or "")
+    tb = _title_tokens(b.title or "")
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
 def _cannot_link(a: Item, b: Item) -> bool:
     """Block two items from clustering into one story when they are provably distinct.
 
@@ -74,10 +112,18 @@ def _cannot_link(a: Item, b: Item) -> bool:
        them bundles e.g. three separate TechCrunch funding pieces under one (wrong)
        title. `mention_count` is a CROSS-source corroboration signal, so within-source
        items must never merge to inflate it.
+    3. When exactly one item in a cross-source pair is an ACADEMIA paper and the pair
+       cannot be verified as the same paper via matching arXiv ids, title-token Jaccard
+       below _PAPER_TITLE_OVERLAP_MIN blocks the merge. This prevents a Reddit post
+       about paper Y from clustering with an HF/arXiv entry for paper X simply because
+       both sit in the same hot sub-topic. A Reddit discussion of the SAME paper will
+       share enough title words to clear the threshold; a genuinely different paper
+       almost never does. Guard 3 is skipped when both items carry titles too short to
+       tokenise (< 3-char words only) — those are test/stub items, not real papers.
 
     Cross-source pairs (different `source`) and cross-family pairs (a paper + its HN
-    thread) are unaffected — that is exactly the same-story-across-outlets case
-    clustering exists to capture.
+    thread about the SAME paper) are unaffected — that is exactly the same-story-
+    across-outlets case clustering exists to capture.
     """
     if a.family == Family.ACADEMIA and b.family == Family.ACADEMIA:
         id_a, id_b = _arxiv_id(a), _arxiv_id(b)
@@ -86,6 +132,22 @@ def _cannot_link(a: Item, b: Item) -> bool:
         pa, pb = _url_path(a.url), _url_path(b.url)
         if pa and pb and pa != pb:
             return True
+    # Guard 3: one item is a paper, the other is not. Verify they describe the same
+    # work before allowing the merge. If both carry the same arXiv id the ingestion
+    # pipeline already confirmed the match — title check not needed. Otherwise fall
+    # back to title overlap, which correctly blocks "BlockPilot" ↔ "Multi-Resolution
+    # Flow Matching" while allowing "Multi-Resolution Flow Matching discussion" ↔ the
+    # HF paper entry (Jaccard ≈ 0.58 >> 0.15).
+    # The guard is SKIPPED when either item's title yields an empty token set (titles
+    # shorter than 3 alphabetic chars, e.g. stub/test items) — 0.0 Jaccard on empty
+    # sets is not a meaningful signal and must not block valid clustering.
+    if a.family == Family.ACADEMIA or b.family == Family.ACADEMIA:
+        id_a, id_b = _arxiv_id(a), _arxiv_id(b)
+        if not (id_a and id_b and id_a == id_b):
+            ta = _title_tokens(a.title or "")
+            tb = _title_tokens(b.title or "")
+            if ta and tb and len(ta & tb) / len(ta | tb) < _PAPER_TITLE_OVERLAP_MIN:
+                return True
     return False
 
 
