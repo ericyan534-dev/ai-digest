@@ -1,4 +1,9 @@
-# ai-digest
+# AI Digest
+
+[![CI](https://github.com/ericyan534-dev/ai-digest/actions/workflows/ci.yml/badge.svg)](https://github.com/ericyan534-dev/ai-digest/actions/workflows/ci.yml)
+[![Digest Pipeline](https://github.com/ericyan534-dev/ai-digest/actions/workflows/digest.yml/badge.svg)](https://github.com/ericyan534-dev/ai-digest/actions/workflows/digest.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/)
 
 > *A smol.ai for an audience of one — that also reads arXiv.*
 
@@ -9,6 +14,18 @@ editorial, serves them in an interactive web app (+ email + Telegram), and
 **learns from your 👍/👎 feedback**.
 
 Full design rationale: [`AI_DIGEST_WIKI.md`](./AI_DIGEST_WIKI.md).
+
+**Reviewing this without an API key?** The entire pipeline runs in a deterministic
+mock-LLM mode — no credentials, no network calls, reproducible output:
+
+```bash
+AIDIGEST_LLM_MOCK=1 make daily   # generate a digest offline
+make test                        # full test suite, mock LLM, zero network
+```
+
+The daily [Digest Pipeline](https://github.com/ericyan534-dev/ai-digest/actions/workflows/digest.yml)
+workflow runs this system on a schedule against live sources, so the badge above reflects a
+system that is actually operating, not just one that compiles.
 
 ---
 
@@ -125,3 +142,11 @@ ACCEPTANCE.md          # the quality gate + editorial rubric + UI design tokens
 
 See [`INTERFACES.md`](./INTERFACES.md), [`API_CONTRACT.md`](./API_CONTRACT.md),
 and [`ACCEPTANCE.md`](./ACCEPTANCE.md) for the exact contracts.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).
+
+Ingested content remains the property of its original publishers. This project stores
+links, metadata, and generated summaries for personal research use; it is not a
+redistribution service for third-party articles or papers.
