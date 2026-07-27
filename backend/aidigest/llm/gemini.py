@@ -327,7 +327,13 @@ def _judge_prompt(
 
 
 def _sanitize_schema(schema: dict) -> dict:
-    """Drop keys Gemini's responseSchema does not accept; keep the structural subset."""
+    """Drop keys Gemini's responseSchema does not accept; keep the structural subset.
+
+    The BOUNDS matter as much as the shape: a schema with no length limits lets a
+    reasoning model run a single string field away until it burns the whole output
+    budget (see generate/weekly.py). These were previously stripped here, so any
+    limit an author wrote was silently discarded before the request was sent.
+    """
     allowed = {
         "type",
         "properties",
@@ -337,6 +343,11 @@ def _sanitize_schema(schema: dict) -> dict:
         "nullable",
         "format",
         "description",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "propertyOrdering",
     }
     out: dict[str, Any] = {}
     for key, value in schema.items():

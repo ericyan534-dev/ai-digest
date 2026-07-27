@@ -78,13 +78,14 @@ def test_render_weekly_html(sample_weekly) -> None:
 
 
 def test_render_weekly_md_blank_digest_shows_only_header_lines() -> None:
-    """Canary for the 2026-07-26 incident: this documents the EXACT blank-output
-    shape that shipped when title/lede/body/shortlist/radar were all empty
-    (truncated, unparseable LLM output) — render_weekly_md emits ONLY the header
-    + meta line, with no body, no honest quiet-week text, and no shortlist/radar
+    """Canary for the blank weekly digest shipped 2026-07-26 (GitHub Actions run
+    30209443924): this documents the EXACT blank-output shape observed in that
+    run, when title/lede/body/shortlist/radar were all empty (truncated,
+    unparseable LLM output) — render_weekly_md emits ONLY the header + meta
+    line, with no body, no honest quiet-week text, and no shortlist/radar
     headings. This test asserts current (correct) renderer behavior; it is the
     canary that motivates the never-blank guard in `generate_weekly` (see
-    tests/test_generate_weekly.py), which is what keeps this shape from ever
+    tests/test_weekly_blank_guard.py), which is what keeps this shape from ever
     reaching a reader.
     """
     blank = WeeklyDigest(

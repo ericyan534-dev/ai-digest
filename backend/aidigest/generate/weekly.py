@@ -51,14 +51,15 @@ from aidigest.models import (
 
 logger = logging.getLogger("aidigest.generate")
 
-# The weekly editorial is the LONGEST single generation in the system: a full
-# narrative body plus two link lists, emitted as one JSON object — and
-# gemini-3.5-flash spends "thoughts" tokens from the SAME budget. At the default
-# 8192 the response hit finishReason=MAX_TOKENS, so the truncated JSON failed to
-# parse and the digest shipped with an empty title/lede/body (observed
-# 2026-07-26). Give the long-form calls room; maxOutputTokens is a CAP, not a
-# spend, so a shorter week costs no more than before.
-_LONG_FORM_MAX_OUTPUT_TOKENS = 32768
+# Modest headroom for the longest generation in the system — NOT a fix for the
+# blank digest on its own. A healthy weekly fits inside the default 8192 (the
+# 2026-07-12 run did, with room to spare); the failures were a runaway string
+# field, which is bounded in _CANDIDATE_SCHEMA above. Measured against the real
+# API: 8192 and 16384 both truncated a runaway, and 32768 did not return at all
+# (the request outran http_timeout_seconds and the server disconnected). So more
+# budget buys a legitimately rich week some room while staying well clear of the
+# request timeout — it does not, and cannot, stop a runaway.
+_LONG_FORM_MAX_OUTPUT_TOKENS = 16384
 
 # How many stories the deterministic fallback body lists when the LLM returns
 # nothing usable.
@@ -75,20 +76,45 @@ _LEAD_ANGLES: list[str] = [
     "Open on what was conspicuously ABSENT or quiet, then pivot to what did move.",
 ]
 
+# BOUNDED BY CONSTRUCTION. An unconstrained string field lets the model run away:
+# on 2026-07-19 the `title` swallowed the rest of the JSON object (the rendered
+# headline contained `", "lede": "...", "body_markdown": ...`), and on 2026-07-26
+# it degenerated into a repetition loop that burned the entire output budget
+# before `body_markdown` was ever reached, so nothing parsed and the digest
+# shipped blank. Lengths cap the runaway, `required` forces the body to exist,
+# `propertyOrdering` pins title/lede/body ahead of the arrays, and the
+# descriptions tell the model what each field is FOR.
 _CANDIDATE_SCHEMA: dict = {
     "type": "object",
+    "required": ["title", "lede", "body_markdown"],
+    "propertyOrdering": ["title", "lede", "body_markdown", "shortlist", "on_my_radar"],
     "properties": {
-        "title": {"type": "string"},
-        "lede": {"type": "string"},
-        "body_markdown": {"type": "string"},
+        "title": {
+            "type": "string",
+            "maxLength": 200,
+            "description": (
+                "One editorial headline, under 15 words. Plain prose — not JSON, "
+                "not a list, not a slug."
+            ),
+        },
+        "lede": {
+            "type": "string",
+            "maxLength": 800,
+            "description": "One or two sentences of narrative opening.",
+        },
+        "body_markdown": {
+            "type": "string",
+            "description": "The full editorial, in markdown.",
+        },
         "shortlist": {
             "type": "array",
+            "maxItems": 8,
             "items": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string"},
-                    "url": {"type": "string"},
-                    "one_liner": {"type": "string"},
+                    "title": {"type": "string", "maxLength": 300},
+                    "url": {"type": "string", "maxLength": 500},
+                    "one_liner": {"type": "string", "maxLength": 400},
                     "family": {
                         "type": "string",
                         "enum": [f.value for f in Family],
@@ -98,12 +124,13 @@ _CANDIDATE_SCHEMA: dict = {
         },
         "on_my_radar": {
             "type": "array",
+            "maxItems": 8,
             "items": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string"},
-                    "url": {"type": "string"},
-                    "one_liner": {"type": "string"},
+                    "title": {"type": "string", "maxLength": 300},
+                    "url": {"type": "string", "maxLength": 500},
+                    "one_liner": {"type": "string", "maxLength": 400},
                     "family": {
                         "type": "string",
                         "enum": [f.value for f in Family],

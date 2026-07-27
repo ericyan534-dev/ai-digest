@@ -8,6 +8,7 @@ to return a fixed item set (no adapters fire, no network).
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -229,6 +230,32 @@ async def test_run_weekly_produces_valid_digest(wired: FakeRepo) -> None:
     WeeklyDigest.model_validate(digest.model_dump(mode="json"))
     assert digest.id.startswith("weekly-2026-W")
     assert digest.id in wired.weeklies
+
+
+@pytest.mark.asyncio
+async def test_run_weekly_step_logs_body_chars_shortlist_radar(
+    wired: FakeRepo, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The `generate_weekly` step's completion log line carries body_chars,
+    shortlist, and radar counts. This is what makes a blank/near-blank editorial
+    visible in the run log (GitHub Actions) instead of only in the delivered
+    email — the gap that let the 2026-07-26 blank digest (run 30209443924) ship
+    unnoticed.
+    """
+    await pipeline.run_ingest()
+    await pipeline.run_process()
+    with caplog.at_level(logging.INFO, logger="aidigest.flows"):
+        digest = await pipeline.run_weekly(week_of="2026-06-21")
+    ok_lines = [
+        r.message
+        for r in caplog.records
+        if r.message.startswith("step=generate_weekly status=ok")
+    ]
+    assert ok_lines, "no completion log line for the generate_weekly step"
+    line = ok_lines[-1]
+    assert f"body_chars={len(digest.body_markdown)}" in line
+    assert f"shortlist={len(digest.shortlist)}" in line
+    assert f"radar={len(digest.on_my_radar)}" in line
 
 
 @pytest.mark.asyncio

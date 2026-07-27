@@ -2,15 +2,20 @@
 
 Production failure (GitHub Actions run 30209443924): every delivered byte of the
 weekly email was its title line and its tier line — no lede, no body, no
-shortlist, no radar. gemini-3.5-flash is a reasoning model that spends "thoughts"
-tokens from the same ``maxOutputTokens`` budget, and the weekly editorial is the
-longest single generation in the system. At the hardcoded 8192-token budget the
-response came back ``finishReason=MAX_TOKENS``, so the truncated JSON parsed to
-``{}`` for both the polish output and the winning candidate, and every field fell
-through to its empty default — yet it was still emailed.
+shortlist, no radar. The truncated JSON parsed to ``{}`` for both the polish
+output and the winning candidate, so every field fell through to its empty
+default — yet it was still emailed.
 
-These tests pin the three defenses: a long-form token budget, a fallback chain
-that prefers any intact draft, and a grounded body that is never empty.
+The cause was a RUNAWAY STRING FIELD, not a budget shortfall. ``_CANDIDATE_SCHEMA``
+placed no length bound on ``title``, and ``_sanitize_schema`` would have stripped
+one anyway. The week before (2026-07-19) the same fault showed its other face: the
+rendered title swallowed the rest of the JSON object. Probing the real API
+confirmed raising the budget does not help — 8192 and 16384 both truncated
+mid-runaway, and 32768 outran the request timeout and never returned.
+
+These tests pin all of it: bounded schema fields that actually reach the API, a
+fallback chain that prefers any intact draft, a grounded body that is never
+empty, and link grounding that fails closed.
 """
 
 from __future__ import annotations
@@ -138,10 +143,10 @@ def week() -> tuple[list[Story], dict[str, Item]]:
 async def test_weekly_requests_the_long_form_token_budget(
     week: tuple[list[Story], dict[str, Item]],
 ) -> None:
-    """Every long-form weekly call must ask for the raised budget, not the default.
+    """Both long-form calls must ask for the raised budget, not the implicit default.
 
-    This is the test that would have caught the original bug: at the implicit
-    8192 default the response truncated and the digest shipped blank.
+    Headroom only — see test_long_form_budget_stays_clear_of_the_request_timeout
+    for why budget alone was never the fix.
     """
     stories, items_by_id = week
     llm = RecordingLLM(candidate_texts=[_INTACT] * 3, polish_text=_INTACT)
@@ -328,3 +333,49 @@ async def test_weekly_without_items_does_not_emit_invented_links() -> None:
         [story], {}, profile=PROFILE, week_of="2026-07-20", llm=llm, judge_llm=llm
     )
     assert digest.shortlist and all(e.url is None for e in digest.shortlist)
+
+
+# --------------------------------------------------------------------------- #
+# Schema bounds: the actual root cause of both weekly incidents
+#
+# 2026-07-19: the rendered title swallowed the rest of the JSON object.
+# 2026-07-26: the title degenerated into a repetition loop that burned the whole
+# output budget before body_markdown was reached, so nothing parsed.
+# Measured against the real API, raising the budget did NOT help (8192 and 16384
+# both truncated mid-runaway; 32768 outran the request timeout entirely) — the
+# fix is bounding the schema so a single string field cannot run away.
+# --------------------------------------------------------------------------- #
+
+
+def test_candidate_schema_bounds_the_runaway_string_fields() -> None:
+    from aidigest.generate.weekly import _CANDIDATE_SCHEMA
+
+    props = _CANDIDATE_SCHEMA["properties"]
+    assert props["title"]["maxLength"] <= 300, "an unbounded title is what ran away"
+    assert props["lede"]["maxLength"] <= 1000
+    assert "body_markdown" in _CANDIDATE_SCHEMA["required"]
+    assert _CANDIDATE_SCHEMA["propertyOrdering"][0] == "title"
+    assert _CANDIDATE_SCHEMA["propertyOrdering"].index("body_markdown") < (
+        _CANDIDATE_SCHEMA["propertyOrdering"].index("shortlist")
+    )
+
+
+def test_sanitize_schema_preserves_bounds_instead_of_dropping_them() -> None:
+    """The bounds are useless if the client strips them before the request."""
+    from aidigest.generate.weekly import _CANDIDATE_SCHEMA
+    from aidigest.llm.gemini import _sanitize_schema
+
+    sent = _sanitize_schema(_CANDIDATE_SCHEMA)
+    assert sent["properties"]["title"]["maxLength"] == 200
+    assert sent["properties"]["title"]["description"]
+    assert sent["required"] == ["title", "lede", "body_markdown"]
+    assert sent["propertyOrdering"][0] == "title"
+    assert sent["properties"]["shortlist"]["maxItems"] == 8
+    assert sent["properties"]["shortlist"]["items"]["properties"]["url"]["maxLength"]
+
+
+def test_long_form_budget_stays_clear_of_the_request_timeout() -> None:
+    """32768 was measured to outrun http_timeout_seconds and never return."""
+    from aidigest.generate.weekly import _LONG_FORM_MAX_OUTPUT_TOKENS
+
+    assert 8192 < _LONG_FORM_MAX_OUTPUT_TOKENS < 32768

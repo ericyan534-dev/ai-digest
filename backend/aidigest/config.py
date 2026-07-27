@@ -9,7 +9,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repo root = .../ai_digest  (this file lives at ai_digest/backend/aidigest/config.py)
@@ -57,6 +57,18 @@ class Settings(BaseSettings):
     # Karpathy-wiki export: when set, digests are also written as linked Markdown
     # notes under this dir (Obsidian-style). Blank => disabled.
     wiki_dir: str = Field(default="", alias="AIDIGEST_WIKI_DIR")
+
+    @field_validator("wiki_dir", mode="after")
+    @classmethod
+    def _reject_leaked_comment(cls, value: str) -> str:
+        """Treat a leaked inline .env comment as "disabled".
+
+        `AIDIGEST_WIKI_DIR=   # set to a dir ...` parses to the COMMENT TEXT, which
+        is truthy — so the exporter would happily create a directory literally
+        named "# set to a dir ...". A path starting with '#' is never a real one.
+        """
+        cleaned = value.strip()
+        return "" if cleaned.startswith("#") else cleaned
 
     # --- LLM call defaults (reasoning model => generous output budget) ---
     # gemini-3.5-flash spends "thoughts" tokens; keep this generous so visible
