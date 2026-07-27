@@ -12,9 +12,18 @@ that never touch the DB).
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from tenacity import (
+    AsyncRetrying,
+    RetryCallState,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from aidigest.config import get_settings
 from aidigest.db import _rows
@@ -34,7 +43,31 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from psycopg import AsyncConnection
     from psycopg_pool import AsyncConnectionPool
 
+logger = logging.getLogger("aidigest.db")
+
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
+
+# Retry budget for Repo.connect() against a transient network/timeout error
+# talking to a remote managed Postgres (see connect()). Mirrors the house
+# style in aidigest/ingest/base.py's with_retry().
+_CONNECT_MAX_ATTEMPTS = 5
+
+
+def _log_connect_retry(retry_state: RetryCallState) -> None:
+    """WARNING-log a transient connect() retry.
+
+    Deliberately logs only the attempt number and exception *class* name —
+    never the DSN or any exception message, since either could echo back
+    connection details (including credentials).
+    """
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    exc_name = type(exc).__name__ if exc is not None else "unknown"
+    logger.warning(
+        "Repo.connect transient failure on attempt %d/%d (%s); retrying",
+        retry_state.attempt_number,
+        _CONNECT_MAX_ATTEMPTS,
+        exc_name,
+    )
 
 
 class Repo:
@@ -46,28 +79,64 @@ class Repo:
 
     # ------------------------------------------------------------- lifecycle
     async def connect(self) -> None:
-        """Open an async connection pool and register the pgvector adapter."""
+        """Open an async connection pool and register the pgvector adapter.
+
+        Bootstrapping talks to the (often remote, managed) Postgres twice —
+        the raw connection in `_ensure_vector_extension` and the pool's own
+        `open(wait=True)` — either of which can hit a transient connection
+        timeout. Retry the whole bootstrap with bounded exponential backoff
+        so one blip doesn't abort a scheduled run; non-transient errors (bad
+        DSN, bad credentials, missing permissions) still fail fast since they
+        aren't in the retryable exception set below.
+        """
         if self._pool is not None:
             return
+        import psycopg  # lazy — keep the module importable without native deps
         from psycopg_pool import AsyncConnectionPool  # lazy
-
-        # Bootstrap: the pool's `configure` callback registers the pgvector type
-        # adapter on EVERY connection, which fails ("vector type not found") on a
-        # brand-new database where the extension isn't installed yet — so the pool
-        # could never open to run init_schema. Ensure the extension exists first on a
-        # one-off raw connection so a fresh deploy (e.g. a new Supabase project)
-        # self-heals instead of dead-locking on this chicken-and-egg.
-        await self._ensure_vector_extension()
 
         async def _configure(conn: AsyncConnection) -> None:
             from pgvector.psycopg import register_vector_async
 
             await register_vector_async(conn)
 
-        self._pool = AsyncConnectionPool(
-            self._dsn, min_size=1, max_size=10, configure=_configure, open=False
+        async def _attempt_open() -> AsyncConnectionPool:
+            # Bootstrap: the pool's `configure` callback registers the pgvector type
+            # adapter on EVERY connection, which fails ("vector type not found") on a
+            # brand-new database where the extension isn't installed yet — so the pool
+            # could never open to run init_schema. Ensure the extension exists first on
+            # a one-off raw connection so a fresh deploy (e.g. a new Supabase project)
+            # self-heals instead of dead-locking on this chicken-and-egg.
+            await self._ensure_vector_extension()
+
+            pool = AsyncConnectionPool(
+                self._dsn, min_size=1, max_size=10, configure=_configure, open=False
+            )
+            try:
+                await pool.open(wait=True)
+            except Exception:
+                # Don't leak a half-opened pool from a failed attempt — the
+                # next retry (or a later call) must build a fresh one.
+                await pool.close()
+                raise
+            return pool
+
+        settings = get_settings()
+        # In offline/mock mode (the test suite) skip the real backoff sleeps so
+        # retry tests stay fast; production keeps full exponential backoff.
+        wait = (
+            wait_exponential(multiplier=0.0, min=0.0, max=0.0)
+            if settings.llm_mock
+            else wait_exponential(multiplier=0.5, min=0.5, max=20.0)
         )
-        await self._pool.open(wait=True)
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(_CONNECT_MAX_ATTEMPTS),
+            wait=wait,
+            retry=retry_if_exception_type((psycopg.OperationalError, TimeoutError, OSError)),
+            before_sleep=_log_connect_retry,
+            reraise=True,
+        ):
+            with attempt:
+                self._pool = await _attempt_open()
 
     async def _ensure_vector_extension(self) -> None:
         """Create the pgvector extension if missing (idempotent), on a raw connection
@@ -222,14 +291,23 @@ class Repo:
         return await self._attach_items(rows)
 
     async def _attach_items(self, rows: list[dict[str, Any]]) -> list[Story]:
-        stories: list[Story] = []
-        for row in rows:
-            members = await self._fetch_dicts(
-                "SELECT item_id FROM story_items WHERE story_id = %s", [row["id"]]
-            )
-            ids = [m["item_id"] for m in members]
-            stories.append(_rows.row_to_story(row, ids))
-        return stories
+        if not rows:
+            return []
+        story_ids = [row["id"] for row in rows]
+        # Single batched query instead of one `story_id = %s` round trip per
+        # story (was O(n) queries for n stories). The old per-story query had
+        # no ORDER BY either, so item order was whatever Postgres returned;
+        # ordering here by (story_id, item_id) makes that deterministic as a
+        # side effect, which is at least as good as before.
+        members = await self._fetch_dicts(
+            "SELECT story_id, item_id FROM story_items WHERE story_id = ANY(%s) "
+            "ORDER BY story_id, item_id",
+            [story_ids],
+        )
+        items_by_story: dict[str, list[str]] = {sid: [] for sid in story_ids}
+        for m in members:
+            items_by_story[m["story_id"]].append(m["item_id"])
+        return [_rows.row_to_story(row, items_by_story[row["id"]]) for row in rows]
 
     # --------------------------------------------------------------- digests
     async def save_daily(self, digest: DailyDigest) -> None:

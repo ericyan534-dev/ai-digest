@@ -12,6 +12,7 @@ No network, no real key. We inject an ``httpx.MockTransport`` into the shared
 from __future__ import annotations
 
 import json
+import logging
 import math
 from unittest.mock import patch
 
@@ -149,6 +150,86 @@ async def test_generate_strips_thoughts_and_handles_max_tokens() -> None:
     assert res.truncated is True
     assert res.thought_tokens == 50
     assert calls["n"] == 2  # retried past the reset
+
+
+# --------------------------------------------------------------------------- #
+# maxOutputTokens budget wiring (regression: 2026-07-26 blank weekly digest —
+# GEMINI_MAX_OUTPUT_TOKENS existed but was never actually passed to the API).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_generate_detailed_default_budget_uses_configured_setting() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200, json={"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}
+        )
+
+    transport = httpx.MockTransport(handler)
+    settings = _settings()
+    with patch("aidigest.llm.gemini.make_async_client", _patched_client_factory(transport)):
+        client = GeminiClient(settings=settings)
+        await client.generate_detailed("hello")
+    body = seen["body"]
+    assert isinstance(body, dict)
+    assert body["generationConfig"]["maxOutputTokens"] == settings.gemini_max_output_tokens
+
+
+@pytest.mark.asyncio
+async def test_generate_detailed_explicit_budget_overrides_setting() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200, json={"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}
+        )
+
+    transport = httpx.MockTransport(handler)
+    with patch("aidigest.llm.gemini.make_async_client", _patched_client_factory(transport)):
+        client = GeminiClient(settings=_settings())
+        await client.generate_detailed("hello", max_output_tokens=32768)
+    body = seen["body"]
+    assert isinstance(body, dict)
+    assert body["generationConfig"]["maxOutputTokens"] == 32768
+
+
+@pytest.mark.asyncio
+async def test_generate_detailed_max_tokens_logs_warning_without_raising(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "finishReason": "MAX_TOKENS",
+                        "content": {"parts": [{"text": "partial output"}]},
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 5,
+                    "thoughtsTokenCount": 100,
+                },
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    with patch("aidigest.llm.gemini.make_async_client", _patched_client_factory(transport)):
+        client = GeminiClient(settings=_settings())
+        with caplog.at_level(logging.WARNING, logger="aidigest.llm"):
+            result = await client.generate_detailed("hello")
+    assert result.truncated is True
+    assert result.text == "partial output"  # never raises; returns the partial text
+    assert any(
+        record.levelno == logging.WARNING and "MAX_TOKENS" in record.message
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

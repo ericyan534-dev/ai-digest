@@ -18,12 +18,14 @@ shortlist and an "On my radar" academia preview.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import date as date_cls
 
 from aidigest.eval.rubric import rubric
 from aidigest.generate._shared import (
     parse_json_obj,
     sources_block,
+    story_items,
     subfields_str,
     venues_str,
 )
@@ -46,6 +48,21 @@ from aidigest.models import (
     WeeklyDigest,
     WeeklyShortlistEntry,
 )
+
+logger = logging.getLogger("aidigest.generate")
+
+# The weekly editorial is the LONGEST single generation in the system: a full
+# narrative body plus two link lists, emitted as one JSON object — and
+# gemini-3.5-flash spends "thoughts" tokens from the SAME budget. At the default
+# 8192 the response hit finishReason=MAX_TOKENS, so the truncated JSON failed to
+# parse and the digest shipped with an empty title/lede/body (observed
+# 2026-07-26). Give the long-form calls room; maxOutputTokens is a CAP, not a
+# spend, so a shorter week costs no more than before.
+_LONG_FORM_MAX_OUTPUT_TOKENS = 32768
+
+# How many stories the deterministic fallback body lists when the LLM returns
+# nothing usable.
+_FALLBACK_STORY_LIMIT = 15
 
 # Distinct lead angles so each candidate opens differently (best-of-N variety).
 _LEAD_ANGLES: list[str] = [
@@ -132,7 +149,11 @@ async def _generate_candidate(
     quiet_week: bool,
     llm: LLMClient,
 ) -> str:
-    """Generate one editorial candidate (raw JSON string)."""
+    """Generate one editorial candidate (raw JSON string).
+
+    Truncation is logged rather than raised: a partial candidate can still lose
+    the judge vote to an intact sibling, and the caller has its own fallback.
+    """
     angle = _LEAD_ANGLES[index % len(_LEAD_ANGLES)]
     prompt_body = load_prompt(WEEKLY_CANDIDATE).format(
         candidate_index=index + 1,
@@ -151,7 +172,20 @@ async def _generate_candidate(
     ]
     # Slight temperature spread broadens candidate diversity.
     temperature = 0.6 + 0.1 * (index % 3)
-    return await llm.generate(messages, json_schema=_CANDIDATE_SCHEMA, temperature=temperature)
+    result = await llm.generate_detailed(
+        messages,
+        json_schema=_CANDIDATE_SCHEMA,
+        temperature=temperature,
+        max_output_tokens=_LONG_FORM_MAX_OUTPUT_TOKENS,
+    )
+    if result.truncated:
+        logger.warning(
+            "weekly candidate %d/%d truncated at %d output tokens",
+            index + 1,
+            n_candidates,
+            _LONG_FORM_MAX_OUTPUT_TOKENS,
+        )
+    return result.text
 
 
 async def _judge(candidates: list[str], *, context: str, llm: LLMClient) -> dict:
@@ -177,17 +211,29 @@ async def _polish(
         Message(role="system", content=voice_prompt()),
         Message(role="user", content=prompt_body),
     ]
-    return await llm.generate(messages, json_schema=_CANDIDATE_SCHEMA, temperature=0.3)
+    result = await llm.generate_detailed(
+        messages,
+        json_schema=_CANDIDATE_SCHEMA,
+        temperature=0.3,
+        max_output_tokens=_LONG_FORM_MAX_OUTPUT_TOKENS,
+    )
+    if result.truncated:
+        logger.warning(
+            "weekly polish truncated at %d output tokens", _LONG_FORM_MAX_OUTPUT_TOKENS
+        )
+    return result.text
 
 
 def _parse_entries(
-    raw_list: object, valid_urls: frozenset[str] = frozenset()
+    raw_list: object, valid_urls: frozenset[str] | None = None
 ) -> list[WeeklyShortlistEntry]:
     """Build WeeklyShortlistEntry list from parsed JSON, skipping bad rows.
 
     GROUNDING: a shortlist URL is kept only if it is a REAL story link (present in
     ``valid_urls``); an invented/mis-attributed URL is nulled so we never link the
-    reader to a fabricated source. Empty ``valid_urls`` disables the check.
+    reader to a fabricated source. ``None`` disables the check (callers that hold
+    no source list); an EMPTY set means "we checked and know of no valid URL", so
+    every link is nulled rather than waved through.
     """
     entries: list[WeeklyShortlistEntry] = []
     if not isinstance(raw_list, list):
@@ -200,7 +246,7 @@ def _parse_entries(
             continue
         family = _coerce_family(row.get("family"))
         raw_url = str(row.get("url") or "").strip() or None
-        url = raw_url if (raw_url and (not valid_urls or raw_url in valid_urls)) else None
+        url = raw_url if (raw_url and (valid_urls is None or raw_url in valid_urls)) else None
         entries.append(
             WeeklyShortlistEntry(
                 title=title, url=url, one_liner=str(row.get("one_liner") or "").strip(),
@@ -242,51 +288,80 @@ async def generate_weekly(
 
     tagged, overall_tier, quiet_week = classify_day(stories, profile=profile)
 
-    # 1. Best-of-N candidate drafts (concurrent).
-    candidates = list(
-        await asyncio.gather(
-            *(
-                _generate_candidate(
-                    index=i,
-                    n_candidates=n,
-                    stories=tagged,
-                    items_by_id=items_by_id,
-                    profile=profile,
-                    week_of=week_of,
-                    overall_tier=overall_tier,
-                    quiet_week=quiet_week,
-                    llm=client,
-                )
-                for i in range(n)
+    # 1. Best-of-N candidate drafts (concurrent). One transport failure must not
+    # take the whole week down with it — that is the point of generating N.
+    settled = await asyncio.gather(
+        *(
+            _generate_candidate(
+                index=i,
+                n_candidates=n,
+                stories=tagged,
+                items_by_id=items_by_id,
+                profile=profile,
+                week_of=week_of,
+                overall_tier=overall_tier,
+                quiet_week=quiet_week,
+                llm=client,
             )
+            for i in range(n)
+        ),
+        return_exceptions=True,
+    )
+    candidates: list[str] = []
+    for index, outcome in enumerate(settled):
+        if isinstance(outcome, BaseException):
+            logger.warning(
+                "weekly candidate %d/%d failed: %s", index + 1, n, type(outcome).__name__
+            )
+            continue
+        candidates.append(outcome)
+
+    winner_idx = 0
+    rationale = ""
+    eval_scores: dict = {}
+    polished_raw = ""
+    if candidates:
+        # 2. Judge -> winner (independent judge client).
+        context = (
+            f"Weekly digest for {week_of}. Overall tier: {overall_tier.value}. "
+            f"Quiet week: {quiet_week}."
         )
-    )
+        verdict = await _judge(candidates, context=context, llm=judge_client)
+        winner_idx = int(verdict.get("winner", 0))
+        if not 0 <= winner_idx < len(candidates):
+            winner_idx = 0
+        rationale = str(verdict.get("rationale") or "")
+        eval_scores = _winner_scores(verdict, winner_idx)
 
-    # 2. Judge -> winner (independent judge client).
-    context = f"Weekly digest for {week_of}. Overall tier: {overall_tier.value}. Quiet week: {quiet_week}."
-    verdict = await _judge(candidates, context=context, llm=judge_client)
-    winner_idx = int(verdict.get("winner", 0))
-    if not 0 <= winner_idx < len(candidates):
-        winner_idx = 0
-    rationale = str(verdict.get("rationale") or "")
-    eval_scores = _winner_scores(verdict, winner_idx)
+        # 3. Polish the winner.
+        polished_raw = await _polish(
+            winning_raw=candidates[winner_idx],
+            n_candidates=n,
+            rationale=rationale,
+            llm=client,
+        )
+    else:
+        logger.error("weekly: every one of %d candidate generations failed", n)
 
-    # 3. Polish the winner.
-    polished_raw = await _polish(
-        winning_raw=candidates[winner_idx],
-        n_candidates=n,
-        rationale=rationale,
-        llm=client,
-    )
-    parsed = parse_json_obj(polished_raw)
-    if not parsed:  # polish failed to parse -> fall back to the winning draft
-        parsed = parse_json_obj(candidates[winner_idx])
+    # Prefer the polished draft, then the judge's winner, then ANY intact candidate.
+    # Truncated JSON parses to {} (or to an object with no body), so with best-of-N
+    # already in hand there is no reason to ship nothing while a sibling draft is
+    # whole.
+    drafts = [polished_raw, *candidates[winner_idx : winner_idx + 1], *candidates]
+    parsed = _first_usable(drafts, n_candidates=n)
 
     title = str(parsed.get("title") or "").strip() or f"Week at a Glance — {week_of}"
     lede = str(parsed.get("lede") or "").strip()
     body = str(parsed.get("body_markdown") or "").strip()
-    if quiet_week and not body:
-        body = "Quiet week — nothing major shipped."
+    if not body:
+        # NEVER ship an empty editorial. A quiet week says so honestly; otherwise
+        # the LLM failed us and the reader still gets the week's real material
+        # rather than a header over blank space (observed 2026-07-26).
+        body = (
+            "Quiet week — nothing major shipped."
+            if quiet_week
+            else _fallback_body(tagged, items_by_id)
+        )
 
     # GROUNDING: only allow shortlist/radar links that point at a REAL story source.
     valid_urls = frozenset(
@@ -311,6 +386,70 @@ async def generate_weekly(
         judge_model=getattr(judge_client, "model", ""),
         eval_scores=eval_scores,
     )
+
+
+def _first_usable(raw_drafts: list[str], *, n_candidates: int) -> dict:
+    """First draft that parses to an object with a non-empty ``body_markdown``.
+
+    Falls back to the first draft that merely parses, then to ``{}`` — the caller
+    supplies a grounded body for that last case. Logs the degradation so a blank
+    or near-blank weekly is visible in the run log instead of silent.
+    """
+    parsed_any: dict = {}
+    for index, raw in enumerate(raw_drafts):
+        parsed = parse_json_obj(raw)
+        if not parsed:
+            continue
+        if not parsed_any:
+            parsed_any = parsed
+        if str(parsed.get("body_markdown") or "").strip():
+            if index > 0:
+                logger.warning(
+                    "weekly: draft %d of the polish/candidate chain was unusable; "
+                    "fell through to a later draft",
+                    index,
+                )
+            return parsed
+    if parsed_any:
+        logger.error("weekly: no draft carried a body; using a partially parsed draft")
+        return parsed_any
+    logger.error(
+        "weekly: no parseable JSON from %d candidates + polish (likely MAX_TOKENS "
+        "truncation); falling back to the deterministic story list",
+        n_candidates,
+    )
+    return {}
+
+
+def _fallback_body(
+    stories: list[Story],
+    items_by_id: dict[str, Item],
+    *,
+    limit: int = _FALLBACK_STORY_LIMIT,
+) -> str:
+    """A deterministic, grounded stand-in body for when the LLM returns nothing.
+
+    Honest by construction: it says the editorial pass failed instead of dressing
+    a raw list up as writing, and every line comes from a real story (no invented
+    facts, links only to source URLs we actually hold).
+    """
+    if not stories:
+        return "Quiet week — nothing major shipped."
+
+    lines = [
+        "_The editorial pass failed to return usable copy this week. "
+        "Below is the week's ranked material, unedited._",
+        "",
+    ]
+    for story in stories[:limit]:
+        title = (story.title or "").strip()
+        if not title:
+            continue
+        members = story_items(story, items_by_id)
+        url = next((it.url for it in members if it.url), None)
+        headline = f"[{title}]({url})" if url else title
+        lines.append(f"- **{headline}** — {story.family.value}, {story.mention_count} mention(s)")
+    return "\n".join(lines)
 
 
 def _winner_scores(verdict: dict, winner_idx: int) -> dict:

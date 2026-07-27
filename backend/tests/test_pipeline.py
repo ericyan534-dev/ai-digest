@@ -249,6 +249,43 @@ def test_weekly_id_format() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Delivery parity — the email text= part must be the FULL rendered digest, not
+# just body_markdown (which drops the shortlist/radar for text-only clients).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_deliver_weekly_sends_full_rendered_markdown_as_email_text(
+    monkeypatch: pytest.MonkeyPatch, sample_weekly: WeeklyDigest
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def _fake_send_email(
+        *, subject: str, html: str, text: str | None = None
+    ) -> bool:
+        captured["subject"] = subject
+        captured["html"] = html
+        captured["text"] = text
+        return True
+
+    # Disable wiki export for this call only (irrelevant to what's under test)
+    # without touching the process-wide cached settings other tests rely on.
+    from aidigest.config import get_settings as _real_get_settings
+
+    hermetic_settings = _real_get_settings().model_copy(update={"wiki_dir": ""})
+    monkeypatch.setattr(pipeline, "send_email", _fake_send_email)
+    monkeypatch.setattr(pipeline, "get_settings", lambda: hermetic_settings)
+
+    await pipeline._deliver_weekly(sample_weekly)
+
+    text = captured.get("text")
+    assert isinstance(text, str) and text
+    assert text == pipeline.render_weekly_md(sample_weekly)
+    assert "What I'd actually read this week" in text
+    assert sample_weekly.shortlist[0].title in text
+
+
+# --------------------------------------------------------------------------- #
 # Fix A — aggregator exclusion
 # --------------------------------------------------------------------------- #
 

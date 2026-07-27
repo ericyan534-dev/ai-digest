@@ -29,7 +29,7 @@ from aidigest.deliver.telegram_bot import (
     send_daily,
     send_message,
 )
-from aidigest.models import DailyDigest
+from aidigest.models import DailyDigest, ImportanceTier, WeeklyDigest
 
 # --------------------------------------------------------------------------- #
 # Markdown
@@ -75,6 +75,40 @@ def test_render_weekly_html(sample_weekly) -> None:
     html = render_weekly_html(sample_weekly)
     assert "<" in html and ">" in html
     assert sample_weekly.title in html
+
+
+def test_render_weekly_md_blank_digest_shows_only_header_lines() -> None:
+    """Canary for the 2026-07-26 incident: this documents the EXACT blank-output
+    shape that shipped when title/lede/body/shortlist/radar were all empty
+    (truncated, unparseable LLM output) — render_weekly_md emits ONLY the header
+    + meta line, with no body, no honest quiet-week text, and no shortlist/radar
+    headings. This test asserts current (correct) renderer behavior; it is the
+    canary that motivates the never-blank guard in `generate_weekly` (see
+    tests/test_generate_weekly.py), which is what keeps this shape from ever
+    reaching a reader.
+    """
+    blank = WeeklyDigest(
+        id="weekly-2026-W99",
+        week_of="2026-07-20",
+        title="Week at a Glance — 2026-07-20",
+        lede="",
+        body_markdown="",
+        overall_tier=ImportanceTier.QUIET_DAY,
+        quiet_week=False,
+        shortlist=[],
+        on_my_radar=[],
+    )
+    md = render_weekly_md(blank)
+    blocks = [b for b in md.strip("\n").split("\n\n") if b.strip()]
+    assert blocks == [
+        f"# {blank.title}",
+        f"`QUIET` · Week of {blank.week_of}",
+    ]
+    # The `QUIET` tier badge is expected (it reflects overall_tier); the honest
+    # quiet-WEEK sentence is a separate, quiet_week-gated block and must be absent.
+    assert "little of consequence shipped" not in md
+    assert "What I'd actually read" not in md
+    assert "On my radar" not in md
 
 
 def test_render_daily_html_quiet(quiet_daily: DailyDigest) -> None:

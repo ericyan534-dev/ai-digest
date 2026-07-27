@@ -60,7 +60,11 @@ class Settings(BaseSettings):
 
     # --- LLM call defaults (reasoning model => generous output budget) ---
     # gemini-3.5-flash spends "thoughts" tokens; keep this generous so visible
-    # text is not starved and MAX_TOKENS truncation is rare.
+    # text is not starved and MAX_TOKENS truncation is rare. This is the DEFAULT
+    # budget: callers that generate long form (see generate/weekly.py) raise it
+    # explicitly. Truncation is logged at WARNING by the Gemini client, so if a
+    # digest ever comes back thin, raise this via the env var rather than
+    # guessing.
     gemini_max_output_tokens: int = Field(default=8192, alias="GEMINI_MAX_OUTPUT_TOKENS")
     gemini_temperature: float = Field(default=0.7, alias="GEMINI_TEMPERATURE")
     http_max_retries: int = Field(default=5, alias="AIDIGEST_HTTP_MAX_RETRIES")

@@ -23,6 +23,7 @@ HARD REQUIREMENTS (see `aidigest/llm/base.py` docstring) honored here:
 from __future__ import annotations
 
 import json
+import logging
 import math
 from typing import Any
 
@@ -31,6 +32,8 @@ from aidigest.eval.rubric import criteria_names
 from aidigest.ingest.base import make_async_client, with_retry
 from aidigest.llm.base import GenerationResult, JsonSchema, Message
 from aidigest.obs.langfuse import get_tracer
+
+logger = logging.getLogger("aidigest.llm")
 
 # Embeddings are batched one-request-per-text (embedContent is single-content);
 # generation is one request per prompt.
@@ -139,7 +142,7 @@ class GeminiClient:
         self,
         prompt: str | list[Message],
         *,
-        max_output_tokens: int = 8192,
+        max_output_tokens: int | None = None,
         temperature: float = 0.7,
         json_schema: JsonSchema = None,
     ) -> str:
@@ -155,13 +158,14 @@ class GeminiClient:
         self,
         prompt: str | list[Message],
         *,
-        max_output_tokens: int = 8192,
+        max_output_tokens: int | None = None,
         temperature: float = 0.7,
         json_schema: JsonSchema = None,
     ) -> GenerationResult:
         contents, system = _prompt_to_contents(prompt)
+        budget = max_output_tokens or self._settings.gemini_max_output_tokens
         gen_config: dict[str, Any] = {
-            "maxOutputTokens": max_output_tokens,
+            "maxOutputTokens": budget,
             "temperature": temperature,
         }
         if json_schema is not None:
@@ -183,6 +187,17 @@ class GeminiClient:
             finish_reason = candidates[0].get("finishReason", "") or ""
 
         prompt_tok, output_tok, thought_tok = _usage_tokens(payload)
+        if finish_reason == "MAX_TOKENS":
+            # Truncation is why a JSON-mode response silently fails to parse and the
+            # caller ends up with an empty digest. Say so in the run log.
+            logger.warning(
+                "gemini truncated: finish_reason=MAX_TOKENS budget=%d output_tokens=%d "
+                "thought_tokens=%d json_mode=%s",
+                budget,
+                output_tok,
+                thought_tok,
+                json_schema is not None,
+            )
         get_tracer().generation(
             name="gemini.generate",
             model=self.model,

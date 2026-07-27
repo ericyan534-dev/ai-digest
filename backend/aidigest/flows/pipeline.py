@@ -26,6 +26,7 @@ from aidigest.deliver.render_md import (
     render_daily_html,
     render_daily_md,
     render_weekly_html,
+    render_weekly_md,
 )
 from aidigest.deliver.telegram_bot import send_daily as tg_send_daily
 from aidigest.deliver.wiki_export import export_daily as wiki_export_daily
@@ -424,7 +425,15 @@ async def run_weekly(*, week_of: str | None = None, deliver: bool = False) -> We
             feedback=feedback,
             llm=llm,
         )
-        s.set(candidates=digest.candidate_count, winner=digest.winning_candidate)
+        # body_chars/shortlist/radar make a blank editorial visible in the run log
+        # instead of silently shipping a header over empty space.
+        s.set(
+            candidates=digest.candidate_count,
+            winner=digest.winning_candidate,
+            body_chars=len(digest.body_markdown),
+            shortlist=len(digest.shortlist),
+            radar=len(digest.on_my_radar),
+        )
 
     async with step("save_weekly"):
         await repo.save_weekly(digest)
@@ -459,10 +468,13 @@ def _week_dates(week_of: str) -> list[str]:
 async def _deliver_weekly(digest: WeeklyDigest) -> None:
     async with step("deliver_weekly") as s:
         html = render_weekly_html(digest)
+        # Parity with _deliver_daily: the plain-text part is the FULL rendered
+        # digest, not just the body — otherwise text-only clients lose the
+        # shortlist and the radar entirely.
         emailed = await send_email(
             subject=digest.title or "AI Digest — Week",
             html=html,
-            text=digest.body_markdown or None,
+            text=render_weekly_md(digest),
         )
         wiki_dir = get_settings().wiki_dir
         wiki_n = (

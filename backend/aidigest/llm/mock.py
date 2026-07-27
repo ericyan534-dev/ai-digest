@@ -50,7 +50,7 @@ class MockLLMClient:
         self,
         prompt: str | list[Message],
         *,
-        max_output_tokens: int = 8192,
+        max_output_tokens: int | None = None,
         temperature: float = 0.7,
         json_schema: JsonSchema = None,
     ) -> str:
@@ -66,7 +66,7 @@ class MockLLMClient:
         self,
         prompt: str | list[Message],
         *,
-        max_output_tokens: int = 8192,
+        max_output_tokens: int | None = None,
         temperature: float = 0.7,
         json_schema: JsonSchema = None,
     ) -> GenerationResult:
