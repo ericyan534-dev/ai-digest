@@ -76,22 +76,25 @@ _LEAD_ANGLES: list[str] = [
     "Open on what was conspicuously ABSENT or quiet, then pivot to what did move.",
 ]
 
-# Bounded where we can bound it. An unconstrained string field lets the model run
-# away: on 2026-07-19 the `title` swallowed the rest of the JSON object (the
-# rendered headline contained `", "lede": "...", "body_markdown": ...`), and on
-# 2026-07-26 it degenerated into a repetition loop that burned the whole output
-# budget, so nothing parsed and the digest shipped blank.
+# An explicit contract: every field required, lengths and counts bounded, order
+# pinned, each field described. Worth having on its own terms — and note that
+# NONE of it reached the API until `_sanitize_schema` was widened to stop
+# stripping the bounds.
 #
-# HONEST LIMIT: this reduces the failure but does NOT eliminate it. Measured on
-# the production-shaped prompt, the runaway simply relocates to `body_markdown`,
-# which cannot carry a maxLength without capping the editorial itself. Treat the
-# guards in generate_weekly as the real protection, not this.
+# HONEST LIMIT — do not re-litigate this without new measurements. Tightening the
+# schema does NOT fix the runaway. Measured on production-shaped prompts, a
+# degenerate generation still fills the whole budget and parses to nothing; the
+# runaway simply relocates to `body_markdown`, which cannot carry a maxLength
+# without capping the editorial itself. Marking all five fields required (rather
+# than three) looked promising at N=1 and did not survive N=5.
 #
-# `required` forces the body to exist, `propertyOrdering` pins title/lede/body
-# ahead of the arrays, and the descriptions tell the model what each field is FOR.
+# What DOES track the failure rate is prompt size/repetitiveness: a dense ~15k-char
+# story block set failed 4 of 4, while a diverse ~8k-char one succeeded 2 of 4.
+# That points at _story_blocks, not at this schema. The guards in generate_weekly
+# are the real protection.
 _CANDIDATE_SCHEMA: dict = {
     "type": "object",
-    "required": ["title", "lede", "body_markdown"],
+    "required": ["title", "lede", "body_markdown", "shortlist", "on_my_radar"],
     "propertyOrdering": ["title", "lede", "body_markdown", "shortlist", "on_my_radar"],
     "properties": {
         "title": {

@@ -13,11 +13,12 @@ does not help — the runaway expands to fill whatever it is given (6.8k output
 tokens at 8192, 13.1k at 16384), and at 32768 the request outran the HTTP
 timeout and never returned.
 
-Bounding the schema helps but does NOT eliminate it: on the production-shaped
-prompt the runaway relocates to ``body_markdown``, which cannot carry a length
-cap without capping the editorial. Asking a reasoning model for a long markdown
-document inside a JSON string is simply unreliable — roughly one call in four
-came back usable in testing.
+Bounding the schema does NOT eliminate it: the runaway relocates to
+``body_markdown``, which cannot carry a length cap without capping the editorial.
+Asking a reasoning model for a long markdown document inside a JSON string is
+simply unreliable. Measured success rate depends on the prompt, not the schema —
+a dense ~15k-char story block set failed 4 of 4, a diverse ~8k-char one succeeded
+2 of 4.
 
 So these tests pin the DEGRADATION PATH as the real protection: a fallback chain
 that prefers any intact draft, a grounded body that is never empty, link
@@ -375,7 +376,7 @@ def test_sanitize_schema_preserves_bounds_instead_of_dropping_them() -> None:
     sent = _sanitize_schema(_CANDIDATE_SCHEMA)
     assert sent["properties"]["title"]["maxLength"] == 200
     assert sent["properties"]["title"]["description"]
-    assert sent["required"] == ["title", "lede", "body_markdown"]
+    assert sent["required"] == list(_CANDIDATE_SCHEMA["properties"])  # every field
     assert sent["propertyOrdering"][0] == "title"
     assert sent["properties"]["shortlist"]["maxItems"] == 8
     assert sent["properties"]["shortlist"]["items"]["properties"]["url"]["maxLength"]
