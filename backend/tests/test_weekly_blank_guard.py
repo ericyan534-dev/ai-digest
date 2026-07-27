@@ -6,16 +6,23 @@ shortlist, no radar. The truncated JSON parsed to ``{}`` for both the polish
 output and the winning candidate, so every field fell through to its empty
 default — yet it was still emailed.
 
-The cause was a RUNAWAY STRING FIELD, not a budget shortfall. ``_CANDIDATE_SCHEMA``
-placed no length bound on ``title``, and ``_sanitize_schema`` would have stripped
-one anyway. The week before (2026-07-19) the same fault showed its other face: the
-rendered title swallowed the rest of the JSON object. Probing the real API
-confirmed raising the budget does not help — 8192 and 16384 both truncated
-mid-runaway, and 32768 outran the request timeout and never returned.
+The cause is a RUNAWAY GENERATION, not a budget shortfall. The week before
+(2026-07-19) the same fault showed its other face: the rendered title swallowed
+the rest of the JSON object. Probing the real API confirmed raising the budget
+does not help — the runaway expands to fill whatever it is given (6.8k output
+tokens at 8192, 13.1k at 16384), and at 32768 the request outran the HTTP
+timeout and never returned.
 
-These tests pin all of it: bounded schema fields that actually reach the API, a
-fallback chain that prefers any intact draft, a grounded body that is never
-empty, and link grounding that fails closed.
+Bounding the schema helps but does NOT eliminate it: on the production-shaped
+prompt the runaway relocates to ``body_markdown``, which cannot carry a length
+cap without capping the editorial. Asking a reasoning model for a long markdown
+document inside a JSON string is simply unreliable — roughly one call in four
+came back usable in testing.
+
+So these tests pin the DEGRADATION PATH as the real protection: a fallback chain
+that prefers any intact draft, a grounded body that is never empty, link
+grounding that fails closed, and candidate failures that cannot take the week
+down. The blank email cannot recur even while the underlying call stays flaky.
 """
 
 from __future__ import annotations
@@ -25,7 +32,6 @@ from datetime import UTC, datetime
 import pytest
 
 from aidigest.generate.weekly import (
-    _LONG_FORM_MAX_OUTPUT_TOKENS,
     _fallback_body,
     _first_usable,
     _parse_entries,
@@ -136,17 +142,19 @@ def week() -> tuple[list[Story], dict[str, Item]]:
 
 
 # --------------------------------------------------------------------------- #
-# The budget that would have prevented the incident
+# Budget: deliberately NOT special-cased
 # --------------------------------------------------------------------------- #
 
 
-async def test_weekly_requests_the_long_form_token_budget(
+async def test_weekly_does_not_special_case_the_output_budget(
     week: tuple[list[Story], dict[str, Item]],
 ) -> None:
-    """Both long-form calls must ask for the raised budget, not the implicit default.
-
-    Headroom only — see test_long_form_budget_stays_clear_of_the_request_timeout
-    for why budget alone was never the fix.
+    """Measured on the real API, a healthy weekly needs ~960 output + ~2650 thought
+    tokens — the configured 8192 default already carries >2x headroom. The failures
+    are runaways that expand to fill whatever budget they get (6.8k output tokens at
+    8192, 13.1k at 16384, and at 32768 the request outran the HTTP timeout entirely).
+    So the weekly must NOT pass an inflated budget: it buys nothing for a good week
+    and lets a bad one burn more time before failing.
     """
     stories, items_by_id = week
     llm = RecordingLLM(candidate_texts=[_INTACT] * 3, polish_text=_INTACT)
@@ -154,10 +162,9 @@ async def test_weekly_requests_the_long_form_token_budget(
         stories, items_by_id, profile=PROFILE, week_of="2026-07-20", llm=llm, judge_llm=llm
     )
     assert llm.budgets, "no generation calls were made"
-    assert all(b == _LONG_FORM_MAX_OUTPUT_TOKENS for b in llm.budgets)
-    # Pinned against the value that actually truncated in production, so lowering
-    # the constant back toward the old implicit default fails here.
-    assert _LONG_FORM_MAX_OUTPUT_TOKENS > 8192
+    assert all(b is None for b in llm.budgets), (
+        "weekly should defer to GEMINI_MAX_OUTPUT_TOKENS, not hardcode a budget"
+    )
     assert llm.candidate_calls == 3 and llm.polish_calls == 1
 
 
@@ -374,8 +381,10 @@ def test_sanitize_schema_preserves_bounds_instead_of_dropping_them() -> None:
     assert sent["properties"]["shortlist"]["items"]["properties"]["url"]["maxLength"]
 
 
-def test_long_form_budget_stays_clear_of_the_request_timeout() -> None:
-    """32768 was measured to outrun http_timeout_seconds and never return."""
-    from aidigest.generate.weekly import _LONG_FORM_MAX_OUTPUT_TOKENS
+def test_body_markdown_is_deliberately_unbounded() -> None:
+    """A maxLength on the body would cap the editorial itself, so it stays open —
+    which is exactly why the runaway relocates there and why the never-blank guard,
+    not the schema, is the real protection."""
+    from aidigest.generate.weekly import _CANDIDATE_SCHEMA
 
-    assert 8192 < _LONG_FORM_MAX_OUTPUT_TOKENS < 32768
+    assert "maxLength" not in _CANDIDATE_SCHEMA["properties"]["body_markdown"]

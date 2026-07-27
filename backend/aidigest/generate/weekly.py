@@ -51,15 +51,15 @@ from aidigest.models import (
 
 logger = logging.getLogger("aidigest.generate")
 
-# Modest headroom for the longest generation in the system — NOT a fix for the
-# blank digest on its own. A healthy weekly fits inside the default 8192 (the
-# 2026-07-12 run did, with room to spare); the failures were a runaway string
-# field, which is bounded in _CANDIDATE_SCHEMA above. Measured against the real
-# API: 8192 and 16384 both truncated a runaway, and 32768 did not return at all
-# (the request outran http_timeout_seconds and the server disconnected). So more
-# budget buys a legitimately rich week some room while staying well clear of the
-# request timeout — it does not, and cannot, stop a runaway.
-_LONG_FORM_MAX_OUTPUT_TOKENS = 16384
+# DELIBERATELY NOT RAISED. Measured against the real API on the production-shaped
+# weekly prompt: a HEALTHY response needs ~960 output + ~2650 thought tokens, so
+# the configured 8192 default already carries >2x headroom. The failures are not
+# long answers being cut off — they are runaway generations that expand to fill
+# whatever budget they are given (6.8k output tokens at 8192; 13.1k at 16384;
+# at 32768 the request outran http_timeout_seconds and never returned at all).
+# Raising the budget therefore buys nothing for a good week and lets a bad one
+# burn more time and money before failing. The guards below are what make this
+# survivable; see the module docstring.
 
 # How many stories the deterministic fallback body lists when the LLM returns
 # nothing usable.
@@ -76,14 +76,19 @@ _LEAD_ANGLES: list[str] = [
     "Open on what was conspicuously ABSENT or quiet, then pivot to what did move.",
 ]
 
-# BOUNDED BY CONSTRUCTION. An unconstrained string field lets the model run away:
-# on 2026-07-19 the `title` swallowed the rest of the JSON object (the rendered
-# headline contained `", "lede": "...", "body_markdown": ...`), and on 2026-07-26
-# it degenerated into a repetition loop that burned the entire output budget
-# before `body_markdown` was ever reached, so nothing parsed and the digest
-# shipped blank. Lengths cap the runaway, `required` forces the body to exist,
-# `propertyOrdering` pins title/lede/body ahead of the arrays, and the
-# descriptions tell the model what each field is FOR.
+# Bounded where we can bound it. An unconstrained string field lets the model run
+# away: on 2026-07-19 the `title` swallowed the rest of the JSON object (the
+# rendered headline contained `", "lede": "...", "body_markdown": ...`), and on
+# 2026-07-26 it degenerated into a repetition loop that burned the whole output
+# budget, so nothing parsed and the digest shipped blank.
+#
+# HONEST LIMIT: this reduces the failure but does NOT eliminate it. Measured on
+# the production-shaped prompt, the runaway simply relocates to `body_markdown`,
+# which cannot carry a maxLength without capping the editorial itself. Treat the
+# guards in generate_weekly as the real protection, not this.
+#
+# `required` forces the body to exist, `propertyOrdering` pins title/lede/body
+# ahead of the arrays, and the descriptions tell the model what each field is FOR.
 _CANDIDATE_SCHEMA: dict = {
     "type": "object",
     "required": ["title", "lede", "body_markdown"],
@@ -200,17 +205,14 @@ async def _generate_candidate(
     # Slight temperature spread broadens candidate diversity.
     temperature = 0.6 + 0.1 * (index % 3)
     result = await llm.generate_detailed(
-        messages,
-        json_schema=_CANDIDATE_SCHEMA,
-        temperature=temperature,
-        max_output_tokens=_LONG_FORM_MAX_OUTPUT_TOKENS,
+        messages, json_schema=_CANDIDATE_SCHEMA, temperature=temperature
     )
     if result.truncated:
         logger.warning(
-            "weekly candidate %d/%d truncated at %d output tokens",
+            "weekly candidate %d/%d truncated (runaway generation); output_tokens=%d",
             index + 1,
             n_candidates,
-            _LONG_FORM_MAX_OUTPUT_TOKENS,
+            result.output_tokens,
         )
     return result.text
 
@@ -239,14 +241,12 @@ async def _polish(
         Message(role="user", content=prompt_body),
     ]
     result = await llm.generate_detailed(
-        messages,
-        json_schema=_CANDIDATE_SCHEMA,
-        temperature=0.3,
-        max_output_tokens=_LONG_FORM_MAX_OUTPUT_TOKENS,
+        messages, json_schema=_CANDIDATE_SCHEMA, temperature=0.3
     )
     if result.truncated:
         logger.warning(
-            "weekly polish truncated at %d output tokens", _LONG_FORM_MAX_OUTPUT_TOKENS
+            "weekly polish truncated (runaway generation); output_tokens=%d",
+            result.output_tokens,
         )
     return result.text
 
