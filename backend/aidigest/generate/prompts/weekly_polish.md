@@ -24,6 +24,6 @@ the draft.
 
 ## Output
 
-Return JSON with the SAME keys as the draft:
-`title`, `lede`, `body_markdown`, `shortlist`, `on_my_radar`
-(shortlist / on_my_radar entries = {{ "title", "url", "one_liner", "family" }}).
+Return the polished editorial as MARKDOWN — the same shape as the draft
+(`# ` headline, lede, body, the two labeled lists). Nothing else: no JSON, no
+code fences, no commentary.

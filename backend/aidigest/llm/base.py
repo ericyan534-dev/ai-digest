@@ -79,7 +79,7 @@ class LLMClient(Protocol):
         self,
         prompt: str | list[Message],
         *,
-        max_output_tokens: int = 8192,
+        max_output_tokens: int | None = None,
         temperature: float = 0.7,
         json_schema: JsonSchema = None,
     ) -> str:
@@ -87,7 +87,11 @@ class LLMClient(Protocol):
 
         Args:
             prompt: a single prompt string OR a list of Message turns.
-            max_output_tokens: generous budget (reasoning model spends thoughts).
+            max_output_tokens: output budget; None uses the configured default
+                (``GEMINI_MAX_OUTPUT_TOKENS``). Long-form callers should raise it
+                explicitly — a reasoning model spends thoughts from this same
+                budget, and JSON-mode output that hits the cap comes back
+                TRUNCATED and unparseable.
             temperature: sampling temperature.
             json_schema: when provided, the model returns JSON conforming to it;
                 the returned string is parseable JSON.
@@ -103,7 +107,7 @@ class LLMClient(Protocol):
         self,
         prompt: str | list[Message],
         *,
-        max_output_tokens: int = 8192,
+        max_output_tokens: int | None = None,
         temperature: float = 0.7,
         json_schema: JsonSchema = None,
     ) -> GenerationResult:

@@ -9,7 +9,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repo root = .../ai_digest  (this file lives at ai_digest/backend/aidigest/config.py)
@@ -58,9 +58,25 @@ class Settings(BaseSettings):
     # notes under this dir (Obsidian-style). Blank => disabled.
     wiki_dir: str = Field(default="", alias="AIDIGEST_WIKI_DIR")
 
+    @field_validator("wiki_dir", mode="after")
+    @classmethod
+    def _reject_leaked_comment(cls, value: str) -> str:
+        """Treat a leaked inline .env comment as "disabled".
+
+        `AIDIGEST_WIKI_DIR=   # set to a dir ...` parses to the COMMENT TEXT, which
+        is truthy — so the exporter would happily create a directory literally
+        named "# set to a dir ...". A path starting with '#' is never a real one.
+        """
+        cleaned = value.strip()
+        return "" if cleaned.startswith("#") else cleaned
+
     # --- LLM call defaults (reasoning model => generous output budget) ---
     # gemini-3.5-flash spends "thoughts" tokens; keep this generous so visible
-    # text is not starved and MAX_TOKENS truncation is rare.
+    # text is not starved and MAX_TOKENS truncation is rare. This is the DEFAULT
+    # budget: callers that generate long form (see generate/weekly.py) raise it
+    # explicitly. Truncation is logged at WARNING by the Gemini client, so if a
+    # digest ever comes back thin, raise this via the env var rather than
+    # guessing.
     gemini_max_output_tokens: int = Field(default=8192, alias="GEMINI_MAX_OUTPUT_TOKENS")
     gemini_temperature: float = Field(default=0.7, alias="GEMINI_TEMPERATURE")
     http_max_retries: int = Field(default=5, alias="AIDIGEST_HTTP_MAX_RETRIES")

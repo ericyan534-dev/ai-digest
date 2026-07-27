@@ -8,6 +8,7 @@ to return a fixed item set (no adapters fire, no network).
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -232,6 +233,32 @@ async def test_run_weekly_produces_valid_digest(wired: FakeRepo) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_weekly_step_logs_body_chars_shortlist_radar(
+    wired: FakeRepo, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The `generate_weekly` step's completion log line carries body_chars,
+    shortlist, and radar counts. This is what makes a blank/near-blank editorial
+    visible in the run log (GitHub Actions) instead of only in the delivered
+    email — the gap that let the 2026-07-26 blank digest (run 30209443924) ship
+    unnoticed.
+    """
+    await pipeline.run_ingest()
+    await pipeline.run_process()
+    with caplog.at_level(logging.INFO, logger="aidigest.flows"):
+        digest = await pipeline.run_weekly(week_of="2026-06-21")
+    ok_lines = [
+        r.message
+        for r in caplog.records
+        if r.message.startswith("step=generate_weekly status=ok")
+    ]
+    assert ok_lines, "no completion log line for the generate_weekly step"
+    line = ok_lines[-1]
+    assert f"body_chars={len(digest.body_markdown)}" in line
+    assert f"shortlist={len(digest.shortlist)}" in line
+    assert f"radar={len(digest.on_my_radar)}" in line
+
+
+@pytest.mark.asyncio
 async def test_run_nightly_grades_latest_daily(wired: FakeRepo) -> None:
     await pipeline.run_ingest()
     await pipeline.run_daily(date="2026-06-21")
@@ -246,6 +273,43 @@ def test_week_of_iso_is_monday() -> None:
 
 def test_weekly_id_format() -> None:
     assert pipeline._weekly_id("2026-06-15") == "weekly-2026-W25"
+
+
+# --------------------------------------------------------------------------- #
+# Delivery parity — the email text= part must be the FULL rendered digest, not
+# just body_markdown (which drops the shortlist/radar for text-only clients).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_deliver_weekly_sends_full_rendered_markdown_as_email_text(
+    monkeypatch: pytest.MonkeyPatch, sample_weekly: WeeklyDigest
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def _fake_send_email(
+        *, subject: str, html: str, text: str | None = None
+    ) -> bool:
+        captured["subject"] = subject
+        captured["html"] = html
+        captured["text"] = text
+        return True
+
+    # Disable wiki export for this call only (irrelevant to what's under test)
+    # without touching the process-wide cached settings other tests rely on.
+    from aidigest.config import get_settings as _real_get_settings
+
+    hermetic_settings = _real_get_settings().model_copy(update={"wiki_dir": ""})
+    monkeypatch.setattr(pipeline, "send_email", _fake_send_email)
+    monkeypatch.setattr(pipeline, "get_settings", lambda: hermetic_settings)
+
+    await pipeline._deliver_weekly(sample_weekly)
+
+    text = captured.get("text")
+    assert isinstance(text, str) and text
+    assert text == pipeline.render_weekly_md(sample_weekly)
+    assert "What I'd actually read this week" in text
+    assert sample_weekly.shortlist[0].title in text
 
 
 # --------------------------------------------------------------------------- #

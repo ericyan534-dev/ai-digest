@@ -1,4 +1,10 @@
-"""Tests for generate.weekly — best-of-N + judge + polish, shortlist, radar."""
+"""Tests for generate.weekly — best-of-N + judge + polish, shortlist, radar.
+
+Regression coverage for the 2026-07-26 blank weekly digest (truncated
+long-form generation, the never-blank fallback chain, `_first_usable`,
+`return_exceptions` candidate resilience, and `_parse_entries` grounding)
+lives in tests/test_weekly_blank_guard.py — don't duplicate it here.
+"""
 
 from __future__ import annotations
 
