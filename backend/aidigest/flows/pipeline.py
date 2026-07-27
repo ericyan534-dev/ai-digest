@@ -364,10 +364,19 @@ async def _stories_for_date(repo: Repo, date: str) -> tuple[list[Story], dict[st
     stale set cached by an earlier run. Past-date replays use whatever is stored.
     """
     async with step("load_stories") as s:
+        curated = 0
         if date == _today_iso():
             logger.info("step=load_stories action=reprocess_today")
-            await run_process()
+            curated = await run_process()
         stories = await repo.get_stories_for_date(date)
+        # CARRY-OVER (intentional): story ids are content-derived and stable, and
+        # upsert_stories leaves created_at alone on conflict, while stories are
+        # bucketed by created_at. So a story the curator picks again today but that
+        # first appeared earlier stays on its original day and does NOT repeat here.
+        # That is the cross-day dedup we want; it is logged because it makes the
+        # curated count and the digest count differ, which otherwise looks like loss.
+        if curated:
+            s.set(carried_over=max(0, curated - len(stories)))
         if not stories and date != _today_iso():
             logger.info("step=load_stories status=empty action=run_process")
             await run_process()

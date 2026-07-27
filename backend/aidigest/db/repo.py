@@ -232,6 +232,10 @@ class Repo:
             VALUES (%(id)s, %(title)s, %(family)s, %(representative_item_id)s, %(embedding)s,
                     %(importance)s, %(personal)s, %(final_rank)s, %(tier)s,
                     %(mention_count)s, %(created_at)s)
+            -- created_at is deliberately NOT updated: it is the story's
+            -- first-seen day, and get_stories_for_date buckets by it. That is what
+            -- keeps a story that recurs across days on the day it broke, so the
+            -- daily digest does not repeat yesterday's news.
             ON CONFLICT (id) DO UPDATE SET
                 title=EXCLUDED.title, family=EXCLUDED.family,
                 representative_item_id=EXCLUDED.representative_item_id,

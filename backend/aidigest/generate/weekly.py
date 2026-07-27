@@ -32,6 +32,7 @@ from aidigest.generate._shared import (
 from aidigest.generate.importance import classify_day
 from aidigest.generate.prompts import (
     WEEKLY_CANDIDATE,
+    WEEKLY_METADATA,
     WEEKLY_POLISH,
     load_prompt,
     voice_prompt,
@@ -76,76 +77,47 @@ _LEAD_ANGLES: list[str] = [
     "Open on what was conspicuously ABSENT or quiet, then pivot to what did move.",
 ]
 
-# An explicit contract: every field required, lengths and counts bounded, order
-# pinned, each field described. Worth having on its own terms — and note that
-# NONE of it reached the API until `_sanitize_schema` was widened to stop
-# stripping the bounds.
-#
-# HONEST LIMIT — do not re-litigate this without new measurements. Tightening the
-# schema does NOT fix the runaway. Measured on production-shaped prompts, a
-# degenerate generation still fills the whole budget and parses to nothing; the
-# runaway simply relocates to `body_markdown`, which cannot carry a maxLength
-# without capping the editorial itself. Marking all five fields required (rather
-# than three) looked promising at N=1 and did not survive N=5.
-#
-# What DOES track the failure rate is prompt size/repetitiveness: a dense ~15k-char
-# story block set failed 4 of 4, while a diverse ~8k-char one succeeded 2 of 4.
-# That points at _story_blocks, not at this schema. The guards in generate_weekly
-# are the real protection.
-_CANDIDATE_SCHEMA: dict = {
+# The weekly packs 20 stories into ONE request, so its per-story source budget is
+# much tighter than the daily's (5 x 600 chars). See _story_blocks.
+_WEEKLY_SOURCE_ITEMS = 2
+_WEEKLY_SOURCE_CHARS = 280
+
+# Metadata only — every field here is SHORT. The editorial body is generated as
+# plain markdown in a separate call and never passes through JSON, because a long
+# markdown document inside a JSON string is what made this unreliable: one
+# degenerate run lost the whole object instead of one field.
+_ENTRY_ARRAY: dict = {
+    "type": "array",
+    "maxItems": 8,
+    "items": {
+        "type": "object",
+        "required": ["title", "one_liner", "family"],
+        "properties": {
+            "title": {"type": "string", "maxLength": 300},
+            "url": {"type": "string", "maxLength": 500},
+            "one_liner": {"type": "string", "maxLength": 400},
+            "family": {"type": "string", "enum": [f.value for f in Family]},
+        },
+    },
+}
+
+_METADATA_SCHEMA: dict = {
     "type": "object",
-    "required": ["title", "lede", "body_markdown", "shortlist", "on_my_radar"],
-    "propertyOrdering": ["title", "lede", "body_markdown", "shortlist", "on_my_radar"],
+    "required": ["title", "lede", "shortlist", "on_my_radar"],
+    "propertyOrdering": ["title", "lede", "shortlist", "on_my_radar"],
     "properties": {
         "title": {
             "type": "string",
             "maxLength": 200,
-            "description": (
-                "One editorial headline, under 15 words. Plain prose — not JSON, "
-                "not a list, not a slug."
-            ),
+            "description": "The editorial headline, under 15 words. Plain prose.",
         },
         "lede": {
             "type": "string",
-            "maxLength": 800,
-            "description": "One or two sentences of narrative opening.",
+            "maxLength": 600,
+            "description": "The opening one or two sentences, copied from the editorial.",
         },
-        "body_markdown": {
-            "type": "string",
-            "description": "The full editorial, in markdown.",
-        },
-        "shortlist": {
-            "type": "array",
-            "maxItems": 8,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string", "maxLength": 300},
-                    "url": {"type": "string", "maxLength": 500},
-                    "one_liner": {"type": "string", "maxLength": 400},
-                    "family": {
-                        "type": "string",
-                        "enum": [f.value for f in Family],
-                    },
-                },
-            },
-        },
-        "on_my_radar": {
-            "type": "array",
-            "maxItems": 8,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string", "maxLength": 300},
-                    "url": {"type": "string", "maxLength": 500},
-                    "one_liner": {"type": "string", "maxLength": 400},
-                    "family": {
-                        "type": "string",
-                        "enum": [f.value for f in Family],
-                    },
-                },
-            },
-        },
+        "shortlist": _ENTRY_ARRAY,
+        "on_my_radar": _ENTRY_ARRAY,
     },
 }
 
@@ -161,13 +133,21 @@ def _iso_week_id(week_of: str) -> str:
 
 
 def _story_blocks(stories: list[Story], items_by_id: dict[str, Item], *, limit: int = 20) -> str:
-    """Render ranked stories (with tier tags) into a prompt block."""
+    """Render ranked stories (with tier tags) into a prompt block.
+
+    Deliberately leaner than the daily's: the weekly puts ALL of these in one
+    request, and at the daily's bounds that reached ~60k characters. Prompt size
+    is what tracks the degenerate-generation failures — a dense ~15k-char block
+    set failed 4 of 4 against the live API, a ~8k-char one succeeded 2 of 4. The
+    weekly is synthesis, so it needs enough to recognise each story, not the full
+    source text.
+    """
     blocks: list[str] = []
     for story in stories[:limit]:
         blocks.append(
             f"### [{story.tier.value}] {story.title} "
             f"(family={story.family.value}, mentions={story.mention_count})\n"
-            f"{sources_block(story, items_by_id)}"
+            f"{sources_block(story, items_by_id, max_items=_WEEKLY_SOURCE_ITEMS, max_chars=_WEEKLY_SOURCE_CHARS)}"
         )
     return "\n\n".join(blocks) if blocks else "(no stories this week)"
 
@@ -184,10 +164,13 @@ async def _generate_candidate(
     quiet_week: bool,
     llm: LLMClient,
 ) -> str:
-    """Generate one editorial candidate (raw JSON string).
+    """Generate one editorial candidate as PLAIN MARKDOWN.
 
-    Truncation is logged rather than raised: a partial candidate can still lose
-    the judge vote to an intact sibling, and the caller has its own fallback.
+    Not JSON. A long markdown document inside a JSON string field is what made
+    this call unreliable: every newline needs escaping, constrained decoding has
+    to hold the string open for thousands of tokens, and a single degenerate run
+    loses the ENTIRE object rather than one field. Plain text has no parse step
+    to fail, so a partial answer is still a usable answer.
     """
     angle = _LEAD_ANGLES[index % len(_LEAD_ANGLES)]
     prompt_body = load_prompt(WEEKLY_CANDIDATE).format(
@@ -207,9 +190,7 @@ async def _generate_candidate(
     ]
     # Slight temperature spread broadens candidate diversity.
     temperature = 0.6 + 0.1 * (index % 3)
-    result = await llm.generate_detailed(
-        messages, json_schema=_CANDIDATE_SCHEMA, temperature=temperature
-    )
+    result = await llm.generate_detailed(messages, temperature=temperature)
     if result.truncated:
         logger.warning(
             "weekly candidate %d/%d truncated (runaway generation); output_tokens=%d",
@@ -233,7 +214,7 @@ async def _judge(candidates: list[str], *, context: str, llm: LLMClient) -> dict
 async def _polish(
     *, winning_raw: str, n_candidates: int, rationale: str, llm: LLMClient
 ) -> str:
-    """Run the polish pass over the winning draft; return raw JSON string."""
+    """Polish the winning draft. Markdown in, markdown out."""
     prompt_body = load_prompt(WEEKLY_POLISH).format(
         n_candidates=n_candidates,
         judge_rationale=rationale or "(no rationale provided)",
@@ -243,15 +224,71 @@ async def _polish(
         Message(role="system", content=voice_prompt()),
         Message(role="user", content=prompt_body),
     ]
-    result = await llm.generate_detailed(
-        messages, json_schema=_CANDIDATE_SCHEMA, temperature=0.3
-    )
+    result = await llm.generate_detailed(messages, temperature=0.3)
     if result.truncated:
         logger.warning(
             "weekly polish truncated (runaway generation); output_tokens=%d",
             result.output_tokens,
         )
     return result.text
+
+
+async def _metadata(
+    *, body: str, week_of: str, story_lines: str, llm: LLMClient
+) -> dict:
+    """Derive title/lede/shortlist/radar from a finished editorial. Short fields only.
+
+    Separated from the body on purpose: this call can fail without costing us the
+    editorial, and every field it returns is short enough that a runaway has no
+    room to develop.
+    """
+    prompt_body = load_prompt(WEEKLY_METADATA).format(
+        week_of=week_of, editorial=body, story_lines=story_lines
+    )
+    messages = [
+        Message(role="system", content=voice_prompt()),
+        Message(role="user", content=prompt_body),
+    ]
+    try:
+        raw = await llm.generate(
+            messages, json_schema=_METADATA_SCHEMA, temperature=0.2
+        )
+    except Exception as exc:  # metadata is optional; the body already stands
+        logger.warning("weekly metadata call failed: %s", type(exc).__name__)
+        return {}
+    parsed = parse_json_obj(raw)
+    if not parsed:
+        logger.warning("weekly metadata unparseable; deriving from the editorial")
+    return parsed
+
+
+def _title_from_body(body: str) -> str:
+    """First markdown heading, else the first short line."""
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip()
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped and len(stripped) <= 200:
+            return stripped
+    return ""
+
+
+def _lede_from_body(body: str) -> str:
+    """First non-heading paragraph, clipped to a sentence or two."""
+    for block in body.split("\n\n"):
+        text = " ".join(
+            ln.strip() for ln in block.splitlines() if not ln.strip().startswith("#")
+        ).strip()
+        if len(text) < 20:
+            continue
+        if len(text) <= 400:
+            return text
+        cut = text[:400]
+        stop = cut.rfind(". ")
+        return (cut[: stop + 1] if stop > 100 else cut).strip()
+    return ""
 
 
 def _parse_entries(
@@ -373,25 +410,35 @@ async def generate_weekly(
     else:
         logger.error("weekly: every one of %d candidate generations failed", n)
 
-    # Prefer the polished draft, then the judge's winner, then ANY intact candidate.
-    # Truncated JSON parses to {} (or to an object with no body), so with best-of-N
-    # already in hand there is no reason to ship nothing while a sibling draft is
-    # whole.
-    drafts = [polished_raw, *candidates[winner_idx : winner_idx + 1], *candidates]
-    parsed = _first_usable(drafts, n_candidates=n)
-
-    title = str(parsed.get("title") or "").strip() or f"Week at a Glance — {week_of}"
-    lede = str(parsed.get("lede") or "").strip()
-    body = str(parsed.get("body_markdown") or "").strip()
+    # Prefer the polished draft, then the judge's winner, then ANY intact draft.
+    # These are plain markdown now, so "usable" just means non-empty — there is no
+    # parse step left to fail.
+    body = _first_nonempty([polished_raw, *candidates[winner_idx : winner_idx + 1], *candidates])
     if not body:
         # NEVER ship an empty editorial. A quiet week says so honestly; otherwise
         # the LLM failed us and the reader still gets the week's real material
         # rather than a header over blank space (observed 2026-07-26).
+        logger.error("weekly: no draft produced any text; using the story list")
         body = (
             "Quiet week — nothing major shipped."
             if quiet_week
             else _fallback_body(tagged, items_by_id)
         )
+
+    # Metadata is a SEPARATE, short call. If it fails we still have the editorial,
+    # and title/lede come straight out of the prose the model already wrote.
+    meta = await _metadata(
+        body=body,
+        week_of=week_of,
+        story_lines=_story_lines(tagged, items_by_id),
+        llm=client,
+    )
+    title = (
+        str(meta.get("title") or "").strip()
+        or _title_from_body(body)
+        or f"Week at a Glance — {week_of}"
+    )
+    lede = str(meta.get("lede") or "").strip() or _lede_from_body(body)
 
     # GROUNDING: only allow shortlist/radar links that point at a REAL story source.
     valid_urls = frozenset(
@@ -407,8 +454,8 @@ async def generate_weekly(
         body_markdown=body,
         overall_tier=overall_tier,
         quiet_week=quiet_week,
-        shortlist=_parse_entries(parsed.get("shortlist"), valid_urls),
-        on_my_radar=_parse_entries(parsed.get("on_my_radar"), valid_urls),
+        shortlist=_parse_entries(meta.get("shortlist"), valid_urls),
+        on_my_radar=_parse_entries(meta.get("on_my_radar"), valid_urls),
         story_ids=[s.id for s in tagged],
         candidate_count=n,
         winning_candidate=winner_idx,
@@ -418,37 +465,39 @@ async def generate_weekly(
     )
 
 
-def _first_usable(raw_drafts: list[str], *, n_candidates: int) -> dict:
-    """First draft that parses to an object with a non-empty ``body_markdown``.
-
-    Falls back to the first draft that merely parses, then to ``{}`` — the caller
-    supplies a grounded body for that last case. Logs the degradation so a blank
-    or near-blank weekly is visible in the run log instead of silent.
-    """
-    parsed_any: dict = {}
-    for index, raw in enumerate(raw_drafts):
-        parsed = parse_json_obj(raw)
-        if not parsed:
-            continue
-        if not parsed_any:
-            parsed_any = parsed
-        if str(parsed.get("body_markdown") or "").strip():
+def _first_nonempty(drafts: list[str]) -> str:
+    """First draft with actual text in it, stripped. '' when all are empty."""
+    for index, raw in enumerate(drafts):
+        text = _strip_fences(raw).strip()
+        if text:
             if index > 0:
-                logger.warning(
-                    "weekly: draft %d of the polish/candidate chain was unusable; "
-                    "fell through to a later draft",
-                    index,
-                )
-            return parsed
-    if parsed_any:
-        logger.error("weekly: no draft carried a body; using a partially parsed draft")
-        return parsed_any
-    logger.error(
-        "weekly: no parseable JSON from %d candidates + polish (likely MAX_TOKENS "
-        "truncation); falling back to the deterministic story list",
-        n_candidates,
-    )
-    return {}
+                logger.warning("weekly: draft %d was empty; used a later draft", index)
+            return text
+    return ""
+
+
+def _strip_fences(raw: str) -> str:
+    """Drop a wrapping ```markdown fence if the model added one."""
+    text = (raw or "").strip()
+    if not text.startswith("```"):
+        return text
+    body = text[3:]
+    if "\n" in body:
+        body = body.split("\n", 1)[1]
+    return body.removesuffix("```").strip()
+
+
+def _story_lines(stories: list[Story], items_by_id: dict[str, Item], *, limit: int = 20) -> str:
+    """One line per story — title, family, and its real URL — for the metadata call.
+
+    Deliberately links-only: the metadata model must pick shortlist URLs from
+    sources we actually hold, never invent them.
+    """
+    lines: list[str] = []
+    for story in stories[:limit]:
+        url = next((it.url for it in story_items(story, items_by_id) if it.url), "")
+        lines.append(f"- {story.title} (family={story.family.value}) {url}".rstrip())
+    return "\n".join(lines) if lines else "(no stories this week)"
 
 
 def _fallback_body(

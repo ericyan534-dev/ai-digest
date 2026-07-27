@@ -1,41 +1,36 @@
 """Regression tests for the BLANK weekly digest shipped on 2026-07-26.
 
-Production failure (GitHub Actions run 30209443924): every delivered byte of the
-weekly email was its title line and its tier line — no lede, no body, no
-shortlist, no radar. The truncated JSON parsed to ``{}`` for both the polish
-output and the winning candidate, so every field fell through to its empty
-default — yet it was still emailed.
+Production failure (Actions run 30209443924): the whole delivered email was a
+title line and a tier line. The weekly asked for a long markdown editorial inside
+a JSON string field; the generation degenerated, the JSON never closed, and every
+field fell through to its empty default — yet it was still emailed.
 
-The cause is a RUNAWAY GENERATION, not a budget shortfall. The week before
-(2026-07-19) the same fault showed its other face: the rendered title swallowed
-the rest of the JSON object. Probing the real API confirmed raising the budget
-does not help — the runaway expands to fill whatever it is given (6.8k output
-tokens at 8192, 13.1k at 16384), and at 32768 the request outran the HTTP
-timeout and never returned.
+Measured against the live API, the obvious fixes did not work: raising the budget
+(the runaway expands to fill it; 32768 outran the HTTP timeout), bounding `title`
+(the runaway relocates to `body_markdown`), and requiring every field (0 usable in
+4 trials). What tracked the failure was prompt size — a dense ~15k-char story
+block set failed 4 of 4, a diverse ~8k-char one succeeded 2 of 4.
 
-Bounding the schema does NOT eliminate it: the runaway relocates to
-``body_markdown``, which cannot carry a length cap without capping the editorial.
-Asking a reasoning model for a long markdown document inside a JSON string is
-simply unreliable. Measured success rate depends on the prompt, not the schema —
-a dense ~15k-char story block set failed 4 of 4, a diverse ~8k-char one succeeded
-2 of 4.
-
-So these tests pin the DEGRADATION PATH as the real protection: a fallback chain
-that prefers any intact draft, a grounded body that is never empty, link
-grounding that fails closed, and candidate failures that cannot take the week
-down. The blank email cannot recur even while the underlying call stays flaky.
+So the editorial is now generated as PLAIN MARKDOWN, with a separate short-field
+metadata call, and the story blocks are leaner. These tests pin that split plus
+the degradation path that makes a failure survivable.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest
 
 from aidigest.generate.weekly import (
     _fallback_body,
-    _first_usable,
+    _first_nonempty,
+    _lede_from_body,
     _parse_entries,
+    _story_blocks,
+    _strip_fences,
+    _title_from_body,
     generate_weekly,
 )
 from aidigest.llm.base import GenerationResult, JsonSchema, Message
@@ -43,17 +38,29 @@ from aidigest.models import Family, Item, Story
 
 _NOW = datetime(2026, 7, 20, 12, 0, 0, tzinfo=UTC)
 
-_TRUNCATED = '{"title": "Week at a Gla'  # what MAX_TOKENS actually returns
-_INTACT = (
-    '{"title": "The week compute got cheap", "lede": "A real lede.", '
-    '"body_markdown": "A real editorial body.", "shortlist": [], "on_my_radar": []}'
+_EDITORIAL = (
+    "# The week compute got cheap\n\n"
+    "Sparse mixtures finally paid off this week.\n\n"
+    "Two labs shipped models that trade parameters for routing.\n"
+)
+_META = json.dumps(
+    {
+        "title": "The week compute got cheap",
+        "lede": "Sparse mixtures finally paid off this week.",
+        "shortlist": [],
+        "on_my_radar": [],
+    }
 )
 
 PROFILE: dict = {"ranking": {"alpha": 0.5, "beta": 0.4, "gamma": 0.1}}
 
 
 class RecordingLLM:
-    """Fake client that records every call and replays scripted raw responses."""
+    """Fake client that records calls and replays scripted responses.
+
+    Distinguishes the three call sites the way the real flow does: candidate and
+    polish take NO json_schema (markdown), metadata takes one (JSON).
+    """
 
     model = "fake-model"
 
@@ -61,22 +68,26 @@ class RecordingLLM:
         self,
         *,
         candidate_texts: list[str] | None = None,
-        polish_text: str = _TRUNCATED,
+        polish_text: str = _EDITORIAL,
+        metadata_text: str = _META,
         candidate_error: type[Exception] | None = None,
         failing_indexes: set[int] | None = None,
+        metadata_error: type[Exception] | None = None,
     ) -> None:
         self._candidate_texts = candidate_texts
         self._polish_text = polish_text
+        self._metadata_text = metadata_text
         self._candidate_error = candidate_error
         self._failing_indexes = failing_indexes or set()
-        self.budgets: list[int | None] = []
+        self._metadata_error = metadata_error
+        self.schemas: list[JsonSchema] = []
         self.candidate_calls = 0
         self.polish_calls = 0
+        self.metadata_calls = 0
         self.judge_calls = 0
 
     async def generate(self, prompt: str | list[Message], **kwargs: object) -> str:
-        result = await self.generate_detailed(prompt, **kwargs)
-        return result.text
+        return (await self.generate_detailed(prompt, **kwargs)).text  # type: ignore[arg-type]
 
     async def generate_detailed(
         self,
@@ -86,18 +97,23 @@ class RecordingLLM:
         temperature: float = 0.7,
         json_schema: JsonSchema = None,
     ) -> GenerationResult:
-        self.budgets.append(max_output_tokens)
+        self.schemas.append(json_schema)
         text = "\n".join(m.content for m in prompt) if isinstance(prompt, list) else prompt
-        if "polish" in text.lower() or "winning" in text.lower():
+        if json_schema is not None:  # metadata is the only JSON call
+            self.metadata_calls += 1
+            if self._metadata_error is not None:
+                raise self._metadata_error("simulated metadata failure")
+            return GenerationResult(text=self._metadata_text)
+        if "polish" in text.lower():
             self.polish_calls += 1
-            return GenerationResult(text=self._polish_text, truncated=True)
+            return GenerationResult(text=self._polish_text)
         index = self.candidate_calls
         self.candidate_calls += 1
         if self._candidate_error is not None and index in self._failing_indexes:
             raise self._candidate_error("simulated transport failure")
         if self._candidate_texts is not None:
-            return GenerationResult(text=self._candidate_texts[index], truncated=False)
-        return GenerationResult(text=_TRUNCATED, truncated=True)
+            return GenerationResult(text=self._candidate_texts[index])
+        return GenerationResult(text="", truncated=True)  # degenerate: nothing usable
 
     async def judge(self, *, candidates: list[str], rubric: dict, context: str = "") -> dict:
         self.judge_calls += 1
@@ -111,7 +127,7 @@ def _item(iid: str, title: str, *, url: str | None) -> Item:
         family=Family.ACADEMIA,
         url=url,
         title=title,
-        raw_text=f"body for {title}",
+        raw_text="x" * 4000,  # long enough that the weekly's tighter clip bites
         published_at=_NOW,
         fetched_at=_NOW,
     )
@@ -135,38 +151,67 @@ def _story(sid: str, title: str, item: Item, *, score: float = 0.6) -> Story:
 def week() -> tuple[list[Story], dict[str, Item]]:
     linked = _item("i1", "Sparse attention at scale", url="https://arxiv.org/abs/1")
     unlinked = _item("i2", "Unlinked lab announcement", url=None)
-    stories = [
-        _story("s1", "Sparse attention at scale", linked, score=0.7),
-        _story("s2", "Unlinked lab announcement", unlinked, score=0.5),
-    ]
-    return stories, {linked.id: linked, unlinked.id: unlinked}
+    return (
+        [
+            _story("s1", "Sparse attention at scale", linked, score=0.7),
+            _story("s2", "Unlinked lab announcement", unlinked, score=0.5),
+        ],
+        {linked.id: linked, unlinked.id: unlinked},
+    )
 
 
 # --------------------------------------------------------------------------- #
-# Budget: deliberately NOT special-cased
+# The split: long text out of JSON, short fields in
 # --------------------------------------------------------------------------- #
 
 
-async def test_weekly_does_not_special_case_the_output_budget(
+async def test_editorial_is_generated_as_markdown_not_json(
     week: tuple[list[Story], dict[str, Item]],
 ) -> None:
-    """Measured on the real API, a healthy weekly needs ~960 output + ~2650 thought
-    tokens — the configured 8192 default already carries >2x headroom. The failures
-    are runaways that expand to fill whatever budget they get (6.8k output tokens at
-    8192, 13.1k at 16384, and at 32768 the request outran the HTTP timeout entirely).
-    So the weekly must NOT pass an inflated budget: it buys nothing for a good week
-    and lets a bad one burn more time before failing.
-    """
+    """The whole point of the restructure. A long markdown document inside a JSON
+    string is what made this call unreliable — one degenerate run lost the entire
+    object rather than a single field."""
     stories, items_by_id = week
-    llm = RecordingLLM(candidate_texts=[_INTACT] * 3, polish_text=_INTACT)
+    llm = RecordingLLM(candidate_texts=[_EDITORIAL] * 3)
     await generate_weekly(
         stories, items_by_id, profile=PROFILE, week_of="2026-07-20", llm=llm, judge_llm=llm
     )
-    assert llm.budgets, "no generation calls were made"
-    assert all(b is None for b in llm.budgets), (
-        "weekly should defer to GEMINI_MAX_OUTPUT_TOKENS, not hardcode a budget"
-    )
-    assert llm.candidate_calls == 3 and llm.polish_calls == 1
+    assert llm.candidate_calls == 3 and llm.polish_calls == 1 and llm.metadata_calls == 1
+    # Exactly one JSON call, and it is the metadata one.
+    assert sum(s is not None for s in llm.schemas) == 1
+    assert llm.schemas[-1] is not None
+
+
+async def test_metadata_schema_carries_only_short_fields() -> None:
+    from aidigest.generate.weekly import _METADATA_SCHEMA
+
+    assert "body_markdown" not in _METADATA_SCHEMA["properties"]
+    assert _METADATA_SCHEMA["properties"]["title"]["maxLength"] <= 300
+    assert _METADATA_SCHEMA["properties"]["lede"]["maxLength"] <= 1000
+
+
+def test_sanitize_schema_transmits_the_bounds() -> None:
+    """Bounds are useless if the client strips them before the request."""
+    from aidigest.generate.weekly import _METADATA_SCHEMA
+    from aidigest.llm.gemini import _sanitize_schema
+
+    sent = _sanitize_schema(_METADATA_SCHEMA)
+    assert sent["properties"]["title"]["maxLength"] == 200
+    assert sent["required"] == list(_METADATA_SCHEMA["properties"])
+    assert sent["properties"]["shortlist"]["maxItems"] == 8
+
+
+def test_weekly_story_blocks_are_leaner_than_the_daily_default(
+    week: tuple[list[Story], dict[str, Item]],
+) -> None:
+    """Prompt size is what tracked the degenerate generations. The weekly puts 20
+    stories in ONE request, so it must not use the daily's 5x600-char budget."""
+    from aidigest.generate._shared import sources_block
+
+    stories, items_by_id = week
+    weekly = _story_blocks(stories, items_by_id)
+    daily_equivalent = sum(len(sources_block(s, items_by_id)) for s in stories)
+    assert len(weekly) < daily_equivalent
 
 
 # --------------------------------------------------------------------------- #
@@ -174,46 +219,39 @@ async def test_weekly_does_not_special_case_the_output_budget(
 # --------------------------------------------------------------------------- #
 
 
-async def test_all_drafts_truncated_still_yields_a_grounded_body(
+async def test_all_drafts_empty_still_yields_a_grounded_body(
     week: tuple[list[Story], dict[str, Item]], caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The exact production failure: nothing parses, so fall back to real stories."""
     stories, items_by_id = week
-    llm = RecordingLLM()  # every response is truncated JSON
+    llm = RecordingLLM(polish_text="")  # every draft degenerate
     with caplog.at_level("ERROR", logger="aidigest.generate"):
         digest = await generate_weekly(
             stories, items_by_id, profile=PROFILE, week_of="2026-07-20", llm=llm, judge_llm=llm
         )
     assert digest.body_markdown.strip(), "shipped a blank weekly editorial"
     assert "Sparse attention at scale" in digest.body_markdown
-    assert "Unlinked lab announcement" in digest.body_markdown
-    # An operator must be able to find this in the Actions log.
-    assert any("no parseable JSON" in r.message for r in caplog.records)
+    assert any("no draft produced any text" in r.message for r in caplog.records)
 
 
 async def test_intact_candidate_beats_the_deterministic_fallback(
     week: tuple[list[Story], dict[str, Item]],
 ) -> None:
-    """A truncated polish must not discard a sibling draft that is whole."""
+    """An empty polish must not discard a sibling draft that is whole."""
     stories, items_by_id = week
-    llm = RecordingLLM(
-        candidate_texts=[_TRUNCATED, _TRUNCATED, _INTACT], polish_text=_TRUNCATED
-    )
+    llm = RecordingLLM(candidate_texts=["", "", _EDITORIAL], polish_text="")
     digest = await generate_weekly(
         stories, items_by_id, profile=PROFILE, week_of="2026-07-20", llm=llm, judge_llm=llm
     )
-    assert digest.title == "The week compute got cheap"
-    assert digest.body_markdown == "A real editorial body."
+    assert "Sparse mixtures finally paid off" in digest.body_markdown
     assert "editorial pass failed" not in digest.body_markdown
 
 
 async def test_quiet_week_says_so_instead_of_listing_stories(
     week: tuple[list[Story], dict[str, Item]],
 ) -> None:
-    """A genuinely quiet week stays honest rather than padding with a story dump."""
     stories, items_by_id = week
     quiet = [s.model_copy(update={"importance": 0.01, "final_rank": 0.01}) for s in stories]
-    llm = RecordingLLM()
+    llm = RecordingLLM(polish_text="")
     digest = await generate_weekly(
         quiet, items_by_id, profile=PROFILE, week_of="2026-07-20", llm=llm, judge_llm=llm
     )
@@ -222,7 +260,7 @@ async def test_quiet_week_says_so_instead_of_listing_stories(
 
 
 async def test_no_stories_at_all_does_not_crash() -> None:
-    llm = RecordingLLM()
+    llm = RecordingLLM(polish_text="")
     digest = await generate_weekly(
         [], {}, profile=PROFILE, week_of="2026-07-20", llm=llm, judge_llm=llm
     )
@@ -230,7 +268,7 @@ async def test_no_stories_at_all_does_not_crash() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# One failed candidate must not take the week down
+# A failing call must not take the week down
 # --------------------------------------------------------------------------- #
 
 
@@ -239,21 +277,19 @@ async def test_one_failing_candidate_does_not_abort_the_weekly(
 ) -> None:
     stories, items_by_id = week
     llm = RecordingLLM(
-        candidate_texts=[_INTACT, _INTACT, _INTACT],
-        polish_text=_INTACT,
+        candidate_texts=[_EDITORIAL] * 3,
         candidate_error=RuntimeError,
         failing_indexes={1},
     )
     digest = await generate_weekly(
         stories, items_by_id, profile=PROFILE, week_of="2026-07-20", llm=llm, judge_llm=llm
     )
-    assert digest.body_markdown == "A real editorial body."
+    assert "Sparse mixtures finally paid off" in digest.body_markdown
 
 
 async def test_every_candidate_failing_skips_judge_and_polish(
     week: tuple[list[Story], dict[str, Item]], caplog: pytest.LogCaptureFixture
 ) -> None:
-    """No IndexError on an empty candidate list, and no pointless downstream calls."""
     stories, items_by_id = week
     llm = RecordingLLM(candidate_error=RuntimeError, failing_indexes={0, 1, 2})
     with caplog.at_level("ERROR", logger="aidigest.generate"):
@@ -265,24 +301,41 @@ async def test_every_candidate_failing_skips_judge_and_polish(
     assert any("every one of" in r.message for r in caplog.records)
 
 
+async def test_metadata_failure_still_ships_the_editorial(
+    week: tuple[list[Story], dict[str, Item]], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The editorial is the product. Losing its metadata must not lose the prose —
+    title and lede come straight out of the markdown the model already wrote."""
+    stories, items_by_id = week
+    llm = RecordingLLM(candidate_texts=[_EDITORIAL] * 3, metadata_error=RuntimeError)
+    with caplog.at_level("WARNING", logger="aidigest.generate"):
+        digest = await generate_weekly(
+            stories, items_by_id, profile=PROFILE, week_of="2026-07-20", llm=llm, judge_llm=llm
+        )
+    assert digest.body_markdown == _EDITORIAL.strip()
+    assert digest.title == "The week compute got cheap"
+    assert digest.lede.startswith("Sparse mixtures finally paid off")
+    assert any("metadata call failed" in r.message for r in caplog.records)
+
+
 # --------------------------------------------------------------------------- #
-# Unit-level helpers
+# Helpers
 # --------------------------------------------------------------------------- #
 
 
-def test_first_usable_prefers_a_draft_that_carries_a_body() -> None:
-    assert _first_usable([_TRUNCATED, _INTACT], n_candidates=2)["title"] == (
-        "The week compute got cheap"
-    )
+def test_first_nonempty_skips_blanks() -> None:
+    assert _first_nonempty(["", "   ", "real"]) == "real"
+    assert _first_nonempty(["", ""]) == ""
 
 
-def test_first_usable_returns_a_bodyless_draft_rather_than_nothing() -> None:
-    bodyless = '{"title": "Only a title"}'
-    assert _first_usable([bodyless], n_candidates=1) == {"title": "Only a title"}
+def test_strip_fences_unwraps_a_code_fence() -> None:
+    assert _strip_fences("```markdown\n# Title\n\nBody\n```") == "# Title\n\nBody"
+    assert _strip_fences("# Title") == "# Title"
 
 
-def test_first_usable_returns_empty_when_nothing_parses() -> None:
-    assert _first_usable([_TRUNCATED, "also broken {"], n_candidates=2) == {}
+def test_title_and_lede_derive_from_the_markdown() -> None:
+    assert _title_from_body(_EDITORIAL) == "The week compute got cheap"
+    assert _lede_from_body(_EDITORIAL).startswith("Sparse mixtures finally paid off")
 
 
 def test_fallback_body_never_invents_a_link(
@@ -311,8 +364,7 @@ def test_parse_entries_without_a_source_list_keeps_urls() -> None:
 
 
 def test_parse_entries_with_an_empty_source_set_nulls_every_url() -> None:
-    """Previously an empty set silently DISABLED the check, passing invented
-    links straight to the reader whenever no items were loaded."""
+    """An empty set previously DISABLED the check, passing invented links through."""
     rows = [{"title": "A paper", "url": "https://invented.example/a", "one_liner": "x"}]
     entries = _parse_entries(rows, frozenset())
     assert entries[0].title == "A paper"
@@ -331,61 +383,23 @@ async def test_weekly_without_items_does_not_emit_invented_links() -> None:
         mention_count=2,
         created_at=_NOW,
     )
-    shortlisted = (
-        '{"title": "T", "lede": "L", "body_markdown": "B", '
-        '"shortlist": [{"title": "A story", "url": "https://invented.example/x", '
-        '"one_liner": "o", "family": "academia"}], "on_my_radar": []}'
+    meta = json.dumps(
+        {
+            "title": "T",
+            "lede": "L",
+            "shortlist": [
+                {
+                    "title": "A story",
+                    "url": "https://invented.example/x",
+                    "one_liner": "o",
+                    "family": "academia",
+                }
+            ],
+            "on_my_radar": [],
+        }
     )
-    llm = RecordingLLM(candidate_texts=[shortlisted] * 3, polish_text=shortlisted)
+    llm = RecordingLLM(candidate_texts=[_EDITORIAL] * 3, metadata_text=meta)
     digest = await generate_weekly(
         [story], {}, profile=PROFILE, week_of="2026-07-20", llm=llm, judge_llm=llm
     )
     assert digest.shortlist and all(e.url is None for e in digest.shortlist)
-
-
-# --------------------------------------------------------------------------- #
-# Schema bounds: the actual root cause of both weekly incidents
-#
-# 2026-07-19: the rendered title swallowed the rest of the JSON object.
-# 2026-07-26: the title degenerated into a repetition loop that burned the whole
-# output budget before body_markdown was reached, so nothing parsed.
-# Measured against the real API, raising the budget did NOT help (8192 and 16384
-# both truncated mid-runaway; 32768 outran the request timeout entirely) — the
-# fix is bounding the schema so a single string field cannot run away.
-# --------------------------------------------------------------------------- #
-
-
-def test_candidate_schema_bounds_the_runaway_string_fields() -> None:
-    from aidigest.generate.weekly import _CANDIDATE_SCHEMA
-
-    props = _CANDIDATE_SCHEMA["properties"]
-    assert props["title"]["maxLength"] <= 300, "an unbounded title is what ran away"
-    assert props["lede"]["maxLength"] <= 1000
-    assert "body_markdown" in _CANDIDATE_SCHEMA["required"]
-    assert _CANDIDATE_SCHEMA["propertyOrdering"][0] == "title"
-    assert _CANDIDATE_SCHEMA["propertyOrdering"].index("body_markdown") < (
-        _CANDIDATE_SCHEMA["propertyOrdering"].index("shortlist")
-    )
-
-
-def test_sanitize_schema_preserves_bounds_instead_of_dropping_them() -> None:
-    """The bounds are useless if the client strips them before the request."""
-    from aidigest.generate.weekly import _CANDIDATE_SCHEMA
-    from aidigest.llm.gemini import _sanitize_schema
-
-    sent = _sanitize_schema(_CANDIDATE_SCHEMA)
-    assert sent["properties"]["title"]["maxLength"] == 200
-    assert sent["properties"]["title"]["description"]
-    assert sent["required"] == list(_CANDIDATE_SCHEMA["properties"])  # every field
-    assert sent["propertyOrdering"][0] == "title"
-    assert sent["properties"]["shortlist"]["maxItems"] == 8
-    assert sent["properties"]["shortlist"]["items"]["properties"]["url"]["maxLength"]
-
-
-def test_body_markdown_is_deliberately_unbounded() -> None:
-    """A maxLength on the body would cap the editorial itself, so it stays open —
-    which is exactly why the runaway relocates there and why the never-blank guard,
-    not the schema, is the real protection."""
-    from aidigest.generate.weekly import _CANDIDATE_SCHEMA
-
-    assert "maxLength" not in _CANDIDATE_SCHEMA["properties"]["body_markdown"]

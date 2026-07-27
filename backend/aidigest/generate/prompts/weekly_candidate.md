@@ -40,13 +40,6 @@ assigned lead angle below so the drafts differ and a judge can pick the best.
 
 ## Output
 
-Return JSON with exactly these keys:
-
-- `title` — the editorial headline (no marketing adjectives).
-- `lede` — the opening 1–2 sentences (also the strong narrative opening).
-- `body_markdown` — the full editorial in markdown, INCLUDING the two labeled
-  lists described above.
-- `shortlist` — array of {{ "title", "url", "one_liner", "family" }} for "What
-  I'd actually read this week" (family ∈ academia|industry|community|meta).
-- `on_my_radar` — array of {{ "title", "url", "one_liner", "family" }} academia
-  previews (family usually academia).
+Return the editorial as MARKDOWN. Nothing else — no JSON, no code fences, no
+preamble. Start with a `# ` headline line, then the lede paragraph, then the
+body, ending with the two labeled lists described above.

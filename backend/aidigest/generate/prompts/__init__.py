@@ -23,6 +23,7 @@ DAILY_MAP = "daily_map"
 DAILY_REDUCE = "daily_reduce"
 WEEKLY_CANDIDATE = "weekly_candidate"
 WEEKLY_POLISH = "weekly_polish"
+WEEKLY_METADATA = "weekly_metadata"
 EXEMPLARS = "exemplars"
 
 

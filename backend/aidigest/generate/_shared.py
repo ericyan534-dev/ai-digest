@@ -57,16 +57,27 @@ def story_items(story: Story, items_by_id: dict[str, Item]) -> list[Item]:
     return items
 
 
-def sources_block(story: Story, items_by_id: dict[str, Item]) -> str:
-    """Render a story's source items into a compact, bounded text block."""
-    items = story_items(story, items_by_id)[:_MAX_SOURCE_ITEMS]
+def sources_block(
+    story: Story,
+    items_by_id: dict[str, Item],
+    *,
+    max_items: int = _MAX_SOURCE_ITEMS,
+    max_chars: int = _SOURCE_CHARS,
+) -> str:
+    """Render a story's source items into a compact, bounded text block.
+
+    The bounds are caller-tunable because the weekly packs 20 stories into ONE
+    request: at the daily's 5 items x 600 chars that reaches ~60k characters, and
+    prompt size is what correlates with the model degenerating (see weekly.py).
+    """
+    items = story_items(story, items_by_id)[:max_items]
     if not items:
         return f"(no source text available; title: {story.title})"
     lines: list[str] = []
     for item in items:
         body = (item.raw_text or "").strip().replace("\n", " ")
-        if len(body) > _SOURCE_CHARS:
-            body = body[:_SOURCE_CHARS].rstrip() + "…"
+        if len(body) > max_chars:
+            body = body[:max_chars].rstrip() + "…"
         url = item.url or ""
         head = f"- [{item.source}] {item.title}".rstrip()
         if url:
