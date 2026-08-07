@@ -212,9 +212,17 @@ rather than assuming a cron fires on time:
 The catch-up schedules exist for case 2. Every scheduled daily/weekly run passes `--if-missing`,
 which makes it a strict no-op when that date's digest has already been generated *and* delivered,
 so a later slot safely re-attempts a dropped one. Delivery is recorded in the `app_state` table
-(`delivery_daily` / `delivery_weekly`); a run in progress writes `claim_daily` / `claim_weekly`
-so two overlapping runs cannot both send. A claim older than 30 minutes is treated as stale, so a
-crashed run cannot wedge the catch-up.
+(`delivery_daily` / `delivery_weekly`); a run in progress claims `claim_daily` / `claim_weekly`
+through an atomic compare-and-set, so of two overlapping runs exactly one proceeds. A claim older
+than 50 minutes is treated as stale, so a crashed run cannot wedge the catch-up — that TTL must
+stay **above** the job's `timeout-minutes: 45`, since GitHub hard-kills a run at the timeout and a
+claim older than that cannot belong to a live one. A test enforces the invariant.
+
+The gate is deliberately **at-least-once**: it keys on delivery actually being recorded, so a crash
+in the narrow window between a successful send and that record landing makes a later catch-up
+resend. That is the intended trade — gating on the digest row alone would let a genuine delivery
+failure silently cost the day's digest, which is the bug this all exists to prevent. A duplicate
+email is annoying; a missing digest is the defect.
 
 ### When something fails
 
@@ -227,8 +235,12 @@ Recovery, in order of preference:
 
 1. **Do nothing** — the next catch-up slot re-attempts it automatically.
 2. Run it now: Actions > Digest Pipeline > Run workflow > `daily-catchup` (safe; skips if the
-   digest already shipped).
-3. Force a regeneration and re-send: same menu, `daily`.
+   digest already shipped, and backs off if a run is in flight).
+3. Force a regeneration and re-send: same menu, `daily`. **Check the Actions tab for a running
+   pipeline job first** — force is deliberately unconditional, so forcing while a scheduled run is
+   still working on the same date sends the digest twice. The forced run logs
+   `status=override reason=in_flight_claim_detected` when it overrides a live claim, but it does
+   not stop.
 
 A digest missed for a whole past day is not back-filled: stories are bucketed by the day they were
 first processed, so re-running for an old date cannot reconstruct that day's story set. Yesterday's

@@ -27,6 +27,19 @@ on:
     - cron: "0 17 * * *" # daily catch-up #1 — +3h after the 14:00 daily slot
     - cron: "0 20 * * *" # daily catch-up #2 — +6h after the 14:00 daily slot
     - cron: "0 18 * * 0" # weekly catch-up — Sunday +3h after the 15:00 weekly slot
+    #
+    # LATENT RISK (documented, not fixed): the --if-missing no-op guarantee
+    # depends on the primary slot and its catch-up(s) resolving to the SAME
+    # local digest date/id (see _today_iso/_week_of_iso in pipeline.py, which
+    # bucket by AIDIGEST_TIMEZONE). That holds today because 14:00-20:00 UTC
+    # sits inside a single local calendar day for America/Los_Angeles (the
+    # default). If AIDIGEST_TIMEZONE were ever set to a zone where that
+    # window straddles local midnight, the primary and its catch-up(s) would
+    # resolve to DIFFERENT local dates, gate on different digest ids, and the
+    # no-op guarantee would silently break — a catch-up could generate and
+    # deliver a second, separate digest instead of recognizing the first as
+    # already done. Re-derive the catch-up offsets (or the whole cron/
+    # timezone scheme) before ever changing AIDIGEST_TIMEZONE off the default.
   workflow_dispatch:
     inputs:
       job:
@@ -44,6 +57,13 @@ jobs:
     # weekly editorial (best-of-N + polish) is the heaviest generation in the
     # system and a daily run alone already takes ~5-6 minutes, so 45 still
     # bounds a hung run well under GitHub's 6h default.
+    #
+    # INVARIANT: backend/aidigest/flows/pipeline.py's `_CLAIM_TTL` MUST stay
+    # strictly greater than this value (currently 50 min). If it did not, a
+    # legitimately slow-but-healthy run's own in-flight claim could go stale
+    # while the run is still executing, and a catch-up slot would then win
+    # the claim race and double-deliver underneath it. Enforced mechanically
+    # by test_claim_ttl_exceeds_the_pipeline_job_timeout.
     timeout-minutes: 45
     defaults:
       run:

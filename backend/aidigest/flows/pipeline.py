@@ -72,7 +72,59 @@ DAILY_ITEM_PER_SOURCE_CAP = 20
 # A claim (see `Repo.claim_digest_run`) older than this is presumed abandoned by a
 # crashed/killed run and must NOT block catch-up (`run_daily_if_missing` /
 # `run_weekly_if_missing`) forever.
-_CLAIM_TTL = timedelta(minutes=30)
+#
+# INVARIANT: this MUST be strictly greater than the pipeline job's
+# `timeout-minutes: 45` in .github/workflows/digest.yml (see the reciprocal
+# comment there). GitHub hard-kills a run at that timeout, so a claim older
+# than the timeout can never belong to a still-live run. If this TTL were
+# <= the job timeout, a legitimately slow (but healthy) run's own claim could
+# go stale WHILE it is still executing, and a catch-up would see "stale", win
+# the CAS, and generate + deliver a second time underneath the still-running
+# original. Blocking catch-up for 50 min instead of 30 after an actual crash
+# costs nothing — the catch-up slots are 3h apart. Enforced mechanically by
+# test_claim_ttl_exceeds_the_pipeline_job_timeout (tests/test_digest_catchup.py).
+_CLAIM_TTL = timedelta(minutes=50)
+
+
+def _claim_is_fresh(claim: dict) -> bool:
+    """True when `claim["at"]` (an isoformat timestamp) is younger than `_CLAIM_TTL`.
+
+    Any malformed/missing timestamp is treated as NOT fresh — a claim we can't
+    date must not be trusted as still in flight.
+    """
+    at_raw = claim.get("at")
+    if not isinstance(at_raw, str):
+        return False
+    try:
+        at = datetime.fromisoformat(at_raw)
+    except ValueError:
+        return False
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=UTC)
+    return datetime.now(UTC) - at < _CLAIM_TTL
+
+
+async def _warn_if_claim_in_flight(repo: Repo, kind: DigestKind, date: str) -> None:
+    """Force-path safety net: run_daily/run_weekly's own `claim_digest_run` is an
+    UNCONDITIONAL overwrite, not a compare-and-set — that is deliberate, because
+    the manual force/override path (and the gated path's eventual winner) must
+    never be blocked. But an unconditional overwrite is also silent about
+    clobbering a claim another run may still be actively holding, which can
+    cause a double-delivery if that other run is genuinely still executing.
+    This is a plain READ (not a claim, not atomic — no compare-and-set needed
+    here since it never changes the outcome, only the log), logging a WARNING
+    when a fresh claim for the SAME date already exists so the risk is visible
+    in the run log instead of an invisible foot-gun. It never blocks the run.
+    """
+    claim = await repo.get_claim(kind)
+    if claim is not None and claim.get("date") == date and _claim_is_fresh(claim):
+        logger.warning(
+            "step=claim kind=%s date=%s status=override reason=in_flight_claim_detected "
+            "— overriding a claim another run may still be actively holding; "
+            "this run may double-deliver",
+            kind.value,
+            date,
+        )
 
 
 def _in_daily_window(item: Item, now: datetime) -> bool:
@@ -332,14 +384,28 @@ async def _rank_stories(
 # --------------------------------------------------------------------------- #
 
 
-async def run_daily(*, date: str | None = None, deliver: bool = False) -> DailyDigest:
-    """Full daily: ensure stories, classify tiers, generate, save, optionally deliver."""
+async def run_daily(
+    *, date: str | None = None, deliver: bool = False, _claim_already_acquired: bool = False
+) -> DailyDigest:
+    """Full daily: ensure stories, classify tiers, generate, save, optionally deliver.
+
+    `_claim_already_acquired` is INTERNAL — set only by `_catch_up`'s `run()`
+    callback, which has just atomically won this exact claim via
+    `repo.try_claim_digest_run` a moment earlier. It suppresses the redundant
+    in-flight-claim WARNING (see `_warn_if_claim_in_flight`): without it, EVERY
+    successful catch-up run would log a false "may double-deliver" alarm about
+    the claim it just legitimately won itself, which is worse than no warning
+    at all. Every other caller (the CLI's force path, direct use) leaves this
+    False, which is the only behavior they should ever see.
+    """
     date = date or _today_iso()
     repo = await get_repo()
     llm = get_llm()
     profile = await _effective_profile(repo)
 
     async with step("claim") as s:
+        if not _claim_already_acquired:
+            await _warn_if_claim_in_flight(repo, DigestKind.DAILY, date)
         await repo.claim_digest_run(DigestKind.DAILY, date)
         s.set(date=date)
 
@@ -418,14 +484,21 @@ async def _deliver_daily(digest: DailyDigest, *, repo: Repo) -> None:
             subject=f"AI Digest — {digest.date}", html=html, text=render_daily_md(digest)
         )
         telegrammed = await tg_send_daily(digest)
-        wiki_n = (
-            len(wiki_export_daily(digest, wiki_dir=settings.wiki_dir)) if settings.wiki_dir else 0
-        )
 
+        # record_delivery runs IMMEDIATELY after the channel sends, before wiki
+        # export: wiki export is filesystem work unrelated to delivery, and every
+        # extra step here only widens the (unrecoverable in-process) window in
+        # which a crash could lose the fact that a channel already sent — see
+        # _delivery_matches for why that lost-record case is an accepted tradeoff
+        # rather than something to design further around.
         channels_configured = settings.email_enabled or settings.telegram_enabled
         delivered = emailed or telegrammed or not channels_configured
         await repo.record_delivery(
             DigestKind.DAILY, digest.date, email=emailed, telegram=telegrammed, delivered=delivered
+        )
+
+        wiki_n = (
+            len(wiki_export_daily(digest, wiki_dir=settings.wiki_dir)) if settings.wiki_dir else 0
         )
 
         extra: dict[str, object] = {
@@ -444,14 +517,22 @@ async def _deliver_daily(digest: DailyDigest, *, repo: Repo) -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def run_weekly(*, week_of: str | None = None, deliver: bool = False) -> WeeklyDigest:
-    """Full weekly: gather the week's stories, best-of-N editorial, save, deliver."""
+async def run_weekly(
+    *, week_of: str | None = None, deliver: bool = False, _claim_already_acquired: bool = False
+) -> WeeklyDigest:
+    """Full weekly: gather the week's stories, best-of-N editorial, save, deliver.
+
+    `_claim_already_acquired` is INTERNAL — see `run_daily`'s docstring; same
+    reasoning, set only by `_catch_up`'s `run()` callback.
+    """
     week_of = _week_of_iso(week_of)
     repo = await get_repo()
     llm = get_llm()
     profile = await _effective_profile(repo)
 
     async with step("claim") as s:
+        if not _claim_already_acquired:
+            await _warn_if_claim_in_flight(repo, DigestKind.WEEKLY, week_of)
         await repo.claim_digest_run(DigestKind.WEEKLY, week_of)
         s.set(week_of=week_of)
 
@@ -529,6 +610,16 @@ async def _deliver_weekly(digest: WeeklyDigest, *, repo: Repo) -> None:
             html=html,
             text=render_weekly_md(digest),
         )
+
+        # See _deliver_daily: record_delivery runs IMMEDIATELY after the channel
+        # send, before wiki export, to keep the unrecoverable crash window as
+        # small as possible.
+        channels_configured = settings.email_enabled  # weekly has no telegram channel
+        delivered = emailed or not channels_configured
+        await repo.record_delivery(
+            DigestKind.WEEKLY, digest.week_of, email=emailed, telegram=False, delivered=delivered
+        )
+
         wiki_n = (
             len(
                 wiki_export_weekly(
@@ -537,12 +628,6 @@ async def _deliver_weekly(digest: WeeklyDigest, *, repo: Repo) -> None:
             )
             if settings.wiki_dir
             else 0
-        )
-
-        channels_configured = settings.email_enabled  # weekly has no telegram channel
-        delivered = emailed or not channels_configured
-        await repo.record_delivery(
-            DigestKind.WEEKLY, digest.week_of, email=emailed, telegram=False, delivered=delivered
         )
 
         extra: dict[str, object] = {"email": emailed, "wiki": wiki_n, "delivered": delivered}
@@ -559,6 +644,15 @@ async def _deliver_weekly(digest: WeeklyDigest, *, repo: Repo) -> None:
 # Runner" — the job never started, so nothing ran, retried, or alerted. These
 # entrypoints are meant to be scheduled a few hours AFTER the primary daily/weekly
 # slot; they are no-ops when that slot's digest already shipped.
+
+# The type `repo.get_digest(digest_id)` SHOULD return for each kind — used to
+# defend the cast below against a data-integrity anomaly (the digests table's
+# `kind` column and its stored JSON `content.kind` diverging).
+_DIGEST_TYPE_BY_KIND: dict[DigestKind, type[DailyDigest] | type[WeeklyDigest]] = {
+    DigestKind.DAILY: DailyDigest,
+    DigestKind.WEEKLY: WeeklyDigest,
+}
+
 
 async def _catch_up[DigestT: (DailyDigest, WeeklyDigest)](
     repo: Repo,
@@ -578,25 +672,44 @@ async def _catch_up[DigestT: (DailyDigest, WeeklyDigest)](
     1. ALREADY DONE — a stored digest exists for `digest_id` AND (`deliver` is
        False, meaning delivery was never asked for, OR a delivery record exists
        for `kind` whose date matches and whose `delivered` flag is true). Returns
-       the stored digest.
+       the stored digest — UNLESS it is not actually an instance of the type
+       `kind` expects (see `_DIGEST_TYPE_BY_KIND`), which would mean the digests
+       table's `kind` column and its JSON content have diverged. That anomaly is
+       logged loudly at ERROR and treated as NOT already done, falling through
+       to regenerate, rather than handing the caller an object of the wrong
+       type (an unchecked cast would let e.g. a WeeklyDigest reach code that
+       expects a DailyDigest, failing far less diagnosably than here).
     2. COULD NOT ACQUIRE THE CLAIM — `repo.try_claim_digest_run` is an atomic
        compare-and-set (see its docstring): it returns False exactly when
        another run already holds a fresh (younger than `_CLAIM_TTL`) claim for
        this same date, i.e. a run is genuinely in flight right now. Returns
        None. The TTL bound means a crashed run's stale claim stops blocking
-       catch-up after 30 minutes — it can never wedge catch-up forever.
+       catch-up after `_CLAIM_TTL` — it can never wedge catch-up forever.
     3. Otherwise — this call just won the claim, so it delegates to `run` (the
        real run_daily/run_weekly) and returns its result; this is the self-heal
        path for the missed-slot incident.
     """
     stored = await repo.get_digest(digest_id)
-    if stored is not None and (deliver is False or await _delivery_matches(repo, kind, date)):
-        logger.info(
-            "step=catch_up kind=%s status=skip reason=already_delivered date=%s",
+    already_delivered = stored is not None and (
+        deliver is False or await _delivery_matches(repo, kind, date)
+    )
+    if already_delivered:
+        if isinstance(stored, _DIGEST_TYPE_BY_KIND[kind]):
+            logger.info(
+                "step=catch_up kind=%s status=skip reason=already_delivered date=%s",
+                kind.value,
+                date,
+            )
+            return cast(DigestT, stored)
+        logger.error(
+            "step=catch_up kind=%s status=error reason=stored_digest_type_mismatch "
+            "digest_id=%s expected=%s got=%s — treating as not-yet-done and regenerating",
             kind.value,
-            date,
+            digest_id,
+            _DIGEST_TYPE_BY_KIND[kind].__name__,
+            type(stored).__name__,
         )
-        return cast(DigestT, stored)
+        # Deliberately no `return` here: fall through to the claim/regenerate path.
 
     if not await repo.try_claim_digest_run(kind, date, ttl=_CLAIM_TTL):
         logger.info("step=catch_up kind=%s status=skip reason=in_flight date=%s", kind.value, date)
@@ -606,6 +719,20 @@ async def _catch_up[DigestT: (DailyDigest, WeeklyDigest)](
 
 
 async def _delivery_matches(repo: Repo, kind: DigestKind, date: str) -> bool:
+    """Whether `kind`'s delivery record says `date` actually shipped.
+
+    DELIBERATELY at-least-once, not exactly-once: gating "already done" on this
+    record (rather than on the digest row alone) means a crash between a
+    successful channel send and `record_delivery` persisting causes a LATER
+    catch-up to regenerate and resend — a duplicate email. That is an accepted
+    tradeoff, not an oversight: gating on the digest row alone would mean a
+    genuine delivery failure never self-heals, which is the exact silent-
+    missing-digest bug this whole catch-up mechanism exists to fix. A duplicate
+    email is annoying; a missing digest is the defect. (The crash window itself
+    is kept as small as practical — see _deliver_daily/_deliver_weekly, which
+    call record_delivery immediately after the channel sends, before the
+    unrelated wiki export.)
+    """
     delivery = await repo.get_delivery(kind)
     return bool(delivery and delivery.get("date") == date and delivery.get("delivered"))
 
@@ -624,7 +751,10 @@ async def run_daily_if_missing(
         digest_id=f"daily-{date}",
         date=date,
         deliver=deliver,
-        run=lambda: run_daily(date=date, deliver=deliver),
+        # _claim_already_acquired=True: _catch_up's try_claim_digest_run call just
+        # above won this exact claim atomically — suppresses run_daily's redundant
+        # in-flight-claim WARNING (see its docstring / _warn_if_claim_in_flight).
+        run=lambda: run_daily(date=date, deliver=deliver, _claim_already_acquired=True),
     )
 
 
@@ -642,7 +772,8 @@ async def run_weekly_if_missing(
         digest_id=_weekly_id(week_of),
         date=week_of,
         deliver=deliver,
-        run=lambda: run_weekly(week_of=week_of, deliver=deliver),
+        # See run_daily_if_missing above for why _claim_already_acquired=True.
+        run=lambda: run_weekly(week_of=week_of, deliver=deliver, _claim_already_acquired=True),
     )
 
 
