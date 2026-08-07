@@ -180,11 +180,56 @@ run with `--deliver`, so email/Telegram are sent when those secrets are present.
 
 ## 6. Cron Schedule Reference
 
-| Job | Cron (UTC) | Approx. Local (PDT) |
-|-----|-----------|---------------------|
-| Ingest | `0 */3 * * *` | Every 3 hours |
-| Daily digest | `0 14 * * *` | 07:00 |
-| Weekly digest | `0 15 * * 0` | Sunday 08:00 |
-| Nightly recompute | `0 11 * * *` | 04:00 |
+| Job | Cron (UTC) | Nominal Local (PDT) | Notes |
+|-----|-----------|---------------------|-------|
+| Ingest | `0 */3 * * *` | Every 3 hours | |
+| Daily digest | `0 14 * * *` | 07:00 | idempotent (`--if-missing`) |
+| Daily catch-up | `0 17 * * *`, `0 20 * * *` | 10:00, 13:00 | no-op unless the day never shipped |
+| Weekly digest | `0 15 * * 0` | Sunday 08:00 | idempotent (`--if-missing`) |
+| Weekly catch-up | `0 18 * * 0` | Sunday 11:00 | no-op unless the week never shipped |
+| Nightly recompute | `0 11 * * *` | 04:00 | |
 
 To trigger any job manually: GitHub Actions > Digest Pipeline > Run workflow > select job.
+`daily` / `weekly` there are **force** runs — they regenerate and re-send even if the digest
+already shipped. `daily-catchup` / `weekly-catchup` exercise the same gated path cron uses.
+
+### Scheduled runs are late, and sometimes never happen
+
+Two operational facts about GitHub-hosted cron, both measured on this repo — plan around them
+rather than assuming a cron fires on time:
+
+1. **Delay of 1–2.5 h is normal.** Scheduled workflows sit in a shared queue. Ten consecutive
+   daily slots (`0 14 * * *`, 2026-07-27 → 08-05) actually started at 14:59–16:24 UTC: median
+   ≈ 2 h late, max 2 h 25 m. The digest therefore lands nearer 09:00 PDT than the nominal 07:00.
+   Moving the cron earlier trades a late digest for an erratic one — the delay varies by an hour
+   or more day to day — so the schedule is left honest and this table states the nominal time.
+2. **A slot can be dropped entirely.** On 2026-08-06 the daily run (`31118610124`) and the
+   following ingest (`31120872463`) both failed with *"The job was not acquired by Runner of type
+   hosted even after multiple attempts"*: GitHub could not allocate a runner, so the job never
+   started, no application code ran, and no logs exist. Nothing in the pipeline noticed and
+   **no digest was produced or delivered for that day.**
+
+The catch-up schedules exist for case 2. Every scheduled daily/weekly run passes `--if-missing`,
+which makes it a strict no-op when that date's digest has already been generated *and* delivered,
+so a later slot safely re-attempts a dropped one. Delivery is recorded in the `app_state` table
+(`delivery_daily` / `delivery_weekly`); a run in progress writes `claim_daily` / `claim_weekly`
+so two overlapping runs cannot both send. A claim older than 30 minutes is treated as stale, so a
+crashed run cannot wedge the catch-up.
+
+### When something fails
+
+The `alert` job messages Telegram (when `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` are set) with a
+link to the run whenever the pipeline job ends in any state other than success. It deliberately
+fires on `cancelled` as well as `failure`: a runner that is never acquired reports the job as
+**cancelled**, so a bare `if: failure()` would have missed the 2026-08-06 incident entirely.
+
+Recovery, in order of preference:
+
+1. **Do nothing** — the next catch-up slot re-attempts it automatically.
+2. Run it now: Actions > Digest Pipeline > Run workflow > `daily-catchup` (safe; skips if the
+   digest already shipped).
+3. Force a regeneration and re-send: same menu, `daily`.
+
+A digest missed for a whole past day is not back-filled: stories are bucketed by the day they were
+first processed, so re-running for an old date cannot reconstruct that day's story set. Yesterday's
+still-recent items simply surface in today's digest instead.

@@ -16,7 +16,9 @@ network when AIDIGEST_LLM_MOCK=1.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from zoneinfo import ZoneInfo
 
 from aidigest.config import get_settings
@@ -37,7 +39,7 @@ from aidigest.generate.daily import generate_daily
 from aidigest.generate.importance import classify_day
 from aidigest.generate.weekly import generate_weekly
 from aidigest.llm.factory import get_llm
-from aidigest.models import DailyDigest, Family, Item, Story, WeeklyDigest
+from aidigest.models import DailyDigest, DigestKind, Family, Item, Story, WeeklyDigest
 from aidigest.personalize.feedback import (
     feedback_boosts,
     recompute_interest_vector,
@@ -66,6 +68,11 @@ WEEKLY_LOOKBACK = timedelta(days=8)
 # arXiv/HN don't crowd out academia/industry) keeps n ~100 and MATCHES the validated
 # preview path, so the automation produces the same digest that was validated offline.
 DAILY_ITEM_PER_SOURCE_CAP = 20
+
+# A claim (see `Repo.claim_digest_run`) older than this is presumed abandoned by a
+# crashed/killed run and must NOT block catch-up (`run_daily_if_missing` /
+# `run_weekly_if_missing`) forever.
+_CLAIM_TTL = timedelta(minutes=30)
 
 
 def _in_daily_window(item: Item, now: datetime) -> bool:
@@ -332,6 +339,10 @@ async def run_daily(*, date: str | None = None, deliver: bool = False) -> DailyD
     llm = get_llm()
     profile = await _effective_profile(repo)
 
+    async with step("claim") as s:
+        await repo.claim_digest_run(DigestKind.DAILY, date)
+        s.set(date=date)
+
     stories, items_by_id = await _stories_for_date(repo, date)
 
     async with step("classify_day") as s:
@@ -352,7 +363,7 @@ async def run_daily(*, date: str | None = None, deliver: bool = False) -> DailyD
         await repo.save_daily(digest)
 
     if deliver:
-        await _deliver_daily(digest)
+        await _deliver_daily(digest, repo=repo)
     return digest
 
 
@@ -387,8 +398,15 @@ async def _stories_for_date(repo: Repo, date: str) -> tuple[list[Story], dict[st
     return stories, {it.id: it for it in items}
 
 
-async def _deliver_daily(digest: DailyDigest) -> None:
-    """Best-effort delivery; channels self-disable when unconfigured."""
+async def _deliver_daily(digest: DailyDigest, *, repo: Repo) -> None:
+    """Best-effort delivery; channels self-disable when unconfigured.
+
+    Records the outcome via `repo.record_delivery` so `run_daily_if_missing` can
+    tell "generated but never delivered" (the partial-failure case) apart from a
+    digest that actually shipped. When NEITHER channel is configured, `delivered`
+    is honestly True — there was nothing to deliver — but that fact is logged as
+    `channels=none` so it stays visible in the run log.
+    """
     async with step("deliver_daily") as s:
         settings = get_settings()
         html = render_daily_html(
@@ -400,9 +418,25 @@ async def _deliver_daily(digest: DailyDigest) -> None:
             subject=f"AI Digest — {digest.date}", html=html, text=render_daily_md(digest)
         )
         telegrammed = await tg_send_daily(digest)
-        wiki_dir = get_settings().wiki_dir
-        wiki_n = len(wiki_export_daily(digest, wiki_dir=wiki_dir)) if wiki_dir else 0
-        s.set(email=emailed, telegram=telegrammed, wiki=wiki_n)
+        wiki_n = (
+            len(wiki_export_daily(digest, wiki_dir=settings.wiki_dir)) if settings.wiki_dir else 0
+        )
+
+        channels_configured = settings.email_enabled or settings.telegram_enabled
+        delivered = emailed or telegrammed or not channels_configured
+        await repo.record_delivery(
+            DigestKind.DAILY, digest.date, email=emailed, telegram=telegrammed, delivered=delivered
+        )
+
+        extra: dict[str, object] = {
+            "email": emailed,
+            "telegram": telegrammed,
+            "wiki": wiki_n,
+            "delivered": delivered,
+        }
+        if not channels_configured:
+            extra["channels"] = "none"
+        s.set(**extra)
 
 
 # --------------------------------------------------------------------------- #
@@ -416,6 +450,10 @@ async def run_weekly(*, week_of: str | None = None, deliver: bool = False) -> We
     repo = await get_repo()
     llm = get_llm()
     profile = await _effective_profile(repo)
+
+    async with step("claim") as s:
+        await repo.claim_digest_run(DigestKind.WEEKLY, week_of)
+        s.set(week_of=week_of)
 
     async with step("load_week") as s:
         stories = await _week_stories(repo, week_of)
@@ -448,7 +486,7 @@ async def run_weekly(*, week_of: str | None = None, deliver: bool = False) -> We
         await repo.save_weekly(digest)
 
     if deliver:
-        await _deliver_weekly(digest)
+        await _deliver_weekly(digest, repo=repo)
     return digest
 
 
@@ -474,8 +512,14 @@ def _week_dates(week_of: str) -> list[str]:
     return [(start + timedelta(days=i)).isoformat() for i in range(7)]
 
 
-async def _deliver_weekly(digest: WeeklyDigest) -> None:
+async def _deliver_weekly(digest: WeeklyDigest, *, repo: Repo) -> None:
+    """Best-effort delivery (email only — weekly has no Telegram channel).
+
+    Records the outcome via `repo.record_delivery`; see `_deliver_daily` for the
+    `delivered`/`channels=none` semantics, mirrored here with `telegram=False`.
+    """
     async with step("deliver_weekly") as s:
+        settings = get_settings()
         html = render_weekly_html(digest)
         # Parity with _deliver_daily: the plain-text part is the FULL rendered
         # digest, not just the body — otherwise text-only clients lose the
@@ -485,17 +529,121 @@ async def _deliver_weekly(digest: WeeklyDigest) -> None:
             html=html,
             text=render_weekly_md(digest),
         )
-        wiki_dir = get_settings().wiki_dir
         wiki_n = (
             len(
                 wiki_export_weekly(
-                    digest, wiki_dir=wiki_dir, daily_dates=_week_dates(digest.week_of)
+                    digest, wiki_dir=settings.wiki_dir, daily_dates=_week_dates(digest.week_of)
                 )
             )
-            if wiki_dir
+            if settings.wiki_dir
             else 0
         )
-        s.set(email=emailed, wiki=wiki_n)
+
+        channels_configured = settings.email_enabled  # weekly has no telegram channel
+        delivered = emailed or not channels_configured
+        await repo.record_delivery(
+            DigestKind.WEEKLY, digest.week_of, email=emailed, telegram=False, delivered=delivered
+        )
+
+        extra: dict[str, object] = {"email": emailed, "wiki": wiki_n, "delivered": delivered}
+        if not channels_configured:
+            extra["channels"] = "none"
+        s.set(**extra)
+
+
+# --------------------------------------------------------------------------- #
+# Stage 3c: catch-up — self-heal a slot GitHub Actions failed to run at all
+# --------------------------------------------------------------------------- #
+#
+# 2026-08-06 incident: two scheduled runs failed with "job was not acquired by
+# Runner" — the job never started, so nothing ran, retried, or alerted. These
+# entrypoints are meant to be scheduled a few hours AFTER the primary daily/weekly
+# slot; they are no-ops when that slot's digest already shipped.
+
+async def _catch_up[DigestT: (DailyDigest, WeeklyDigest)](
+    repo: Repo,
+    *,
+    kind: DigestKind,
+    digest_id: str,
+    date: str,
+    deliver: bool,
+    run: Callable[[], Awaitable[DigestT]],
+) -> DigestT | None:
+    """Shared run_daily_if_missing / run_weekly_if_missing semantics.
+
+    Checked in this order (already-delivered BEFORE claiming, so a run must not
+    burn its own claim before that check — and so a completed run is never
+    blocked by its own now-irrelevant claim history):
+
+    1. ALREADY DONE — a stored digest exists for `digest_id` AND (`deliver` is
+       False, meaning delivery was never asked for, OR a delivery record exists
+       for `kind` whose date matches and whose `delivered` flag is true). Returns
+       the stored digest.
+    2. COULD NOT ACQUIRE THE CLAIM — `repo.try_claim_digest_run` is an atomic
+       compare-and-set (see its docstring): it returns False exactly when
+       another run already holds a fresh (younger than `_CLAIM_TTL`) claim for
+       this same date, i.e. a run is genuinely in flight right now. Returns
+       None. The TTL bound means a crashed run's stale claim stops blocking
+       catch-up after 30 minutes — it can never wedge catch-up forever.
+    3. Otherwise — this call just won the claim, so it delegates to `run` (the
+       real run_daily/run_weekly) and returns its result; this is the self-heal
+       path for the missed-slot incident.
+    """
+    stored = await repo.get_digest(digest_id)
+    if stored is not None and (deliver is False or await _delivery_matches(repo, kind, date)):
+        logger.info(
+            "step=catch_up kind=%s status=skip reason=already_delivered date=%s",
+            kind.value,
+            date,
+        )
+        return cast(DigestT, stored)
+
+    if not await repo.try_claim_digest_run(kind, date, ttl=_CLAIM_TTL):
+        logger.info("step=catch_up kind=%s status=skip reason=in_flight date=%s", kind.value, date)
+        return None
+
+    return await run()
+
+
+async def _delivery_matches(repo: Repo, kind: DigestKind, date: str) -> bool:
+    delivery = await repo.get_delivery(kind)
+    return bool(delivery and delivery.get("date") == date and delivery.get("delivered"))
+
+
+async def run_daily_if_missing(
+    *, date: str | None = None, deliver: bool = False
+) -> DailyDigest | None:
+    """Catch-up entrypoint: run the daily digest only if `date` has not already
+    shipped and no run for it is currently in flight. See `_catch_up`.
+    """
+    date = date or _today_iso()
+    repo = await get_repo()
+    return await _catch_up(
+        repo,
+        kind=DigestKind.DAILY,
+        digest_id=f"daily-{date}",
+        date=date,
+        deliver=deliver,
+        run=lambda: run_daily(date=date, deliver=deliver),
+    )
+
+
+async def run_weekly_if_missing(
+    *, week_of: str | None = None, deliver: bool = False
+) -> WeeklyDigest | None:
+    """Catch-up entrypoint: run the weekly digest only if `week_of` has not already
+    shipped and no run for it is currently in flight. See `_catch_up`.
+    """
+    week_of = _week_of_iso(week_of)
+    repo = await get_repo()
+    return await _catch_up(
+        repo,
+        kind=DigestKind.WEEKLY,
+        digest_id=_weekly_id(week_of),
+        date=week_of,
+        deliver=deliver,
+        run=lambda: run_weekly(week_of=week_of, deliver=deliver),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -561,7 +709,9 @@ __all__ = [
     "run_ingest",
     "run_process",
     "run_daily",
+    "run_daily_if_missing",
     "run_weekly",
+    "run_weekly_if_missing",
     "run_nightly",
     "as_prefect_flow",
 ]
