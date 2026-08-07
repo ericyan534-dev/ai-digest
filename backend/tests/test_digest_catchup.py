@@ -907,6 +907,31 @@ async def test_run_weekly_does_not_warn_when_claim_is_for_a_different_date(
 
 
 @pytest.mark.asyncio
+async def test_run_weekly_if_missing_does_not_warn_about_its_own_just_won_claim(
+    wired: FakeRepo, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Weekly counterpart of
+    test_run_daily_if_missing_does_not_warn_about_its_own_just_won_claim above.
+
+    Not redundant with the daily test: the thing that could break here is not
+    `_warn_if_claim_in_flight` (shared code, already covered by the daily
+    case) — it is the one-line `_claim_already_acquired=True` argument in
+    `run_weekly_if_missing`'s `run=` lambda specifically. Drop that argument
+    and every weekly catch-up would cry wolf with a false "may double-deliver"
+    warning, and nothing in the daily test would catch it.
+    """
+    with caplog.at_level(logging.WARNING, logger="aidigest.flows"):
+        await pipeline.run_ingest()
+        await pipeline.run_process()
+        digest = await pipeline.run_weekly_if_missing(week_of=WEEK_OF, deliver=False)
+
+    assert digest is not None
+    assert not [
+        r for r in caplog.records if r.levelname == "WARNING"
+    ], "run_weekly_if_missing must never warn about the claim it just atomically won"
+
+
+@pytest.mark.asyncio
 async def test_run_weekly_records_delivery_flags_email_only(
     wired: FakeRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
