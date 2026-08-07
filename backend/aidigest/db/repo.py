@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -493,6 +493,90 @@ class Repo:
     async def get_profile_override(self) -> dict | None:
         return await self.get_app_state("profile_override")
 
+    # ---------------------------------------------------- delivery / claim bookkeeping
+    # Catch-up self-healing (see aidigest/flows/pipeline.py run_daily_if_missing /
+    # run_weekly_if_missing) needs to know, per DigestKind, (a) whether a run is
+    # CURRENTLY in flight and (b) whether the last run actually got delivered — not
+    # just generated. Both ride on the existing app_state key/value table rather than
+    # a schema migration, since the production DB cannot be migrated from here.
+    async def record_delivery(
+        self, kind: DigestKind, date: str, *, email: bool, telegram: bool, delivered: bool
+    ) -> None:
+        """Record the outcome of a delivery attempt for `kind`'s `date`.
+
+        `delivered` is the caller's honest verdict (a channel actually sent, OR no
+        channel is configured so there was nothing to deliver) — this method just
+        persists it.
+        """
+        await self.save_app_state(
+            _delivery_state_key(kind),
+            {
+                "date": date,
+                "at": datetime.now(UTC).isoformat(),
+                "email": email,
+                "telegram": telegram,
+                "delivered": delivered,
+            },
+        )
+
+    async def get_delivery(self, kind: DigestKind) -> dict | None:
+        return await self.get_app_state(_delivery_state_key(kind))
+
+    async def claim_digest_run(self, kind: DigestKind, date: str) -> None:
+        """Unconditionally mark that a run for `kind`/`date` has started.
+
+        Used by run_daily/run_weekly themselves (both the gated and the manual
+        force path) to publish in-flight state and refresh `at` on the winner.
+        For deciding whether to START a run in the first place, use
+        `try_claim_digest_run` instead — this method is a plain overwrite, not a
+        compare-and-set, so two callers racing here would both "win".
+        """
+        await self.save_app_state(
+            _claim_state_key(kind), {"date": date, "at": datetime.now(UTC).isoformat()}
+        )
+
+    async def get_claim(self, kind: DigestKind) -> dict | None:
+        return await self.get_app_state(_claim_state_key(kind))
+
+    async def try_claim_digest_run(self, kind: DigestKind, date: str, *, ttl: timedelta) -> bool:
+        """Atomically try to acquire the in-flight claim for `kind`/`date`.
+
+        Returns True when THIS call won the claim, False when a fresh (younger
+        than `ttl`) claim for the SAME date already exists — i.e. another run is
+        genuinely in flight.
+
+        MUST be a single compare-and-set statement, not read-then-write: two
+        catch-up runs starting within the same window (the routine case this
+        exists for — GitHub delays scheduled runs by 1-2.5h, so a ~3h delay can
+        put the delayed primary and an on-time catch-up slot within seconds of
+        each other) would otherwise both read "no fresh claim" and both proceed,
+        double-sending the digest. `INSERT ... ON CONFLICT DO UPDATE ... WHERE
+        <stale-or-different-date> RETURNING key` makes Postgres itself pick
+        exactly one winner atomically — that atomicity is the entire reason this
+        method exists as a single statement instead of get_claim + claim_digest_run.
+
+        The staleness check compares against Postgres `now()`, never a Python
+        timestamp, so two runners' clocks can never disagree about what "stale"
+        means. `ttl` is passed through as a `timedelta` (psycopg adapts it to
+        `interval`) — never string-formatted into the query.
+        """
+        sql = """
+            INSERT INTO app_state (key, value, updated_at)
+            VALUES (%(key)s, jsonb_build_object('date', %(date)s::text, 'at', now()), now())
+            ON CONFLICT (key) DO UPDATE SET
+                value = jsonb_build_object('date', %(date)s::text, 'at', now()),
+                updated_at = now()
+            WHERE (app_state.value ->> 'date') IS DISTINCT FROM %(date)s
+               OR (app_state.value ->> 'at')::timestamptz < now() - %(ttl)s
+            RETURNING key
+        """
+        async with self._require_pool().connection() as conn:
+            cur = await conn.execute(
+                sql, {"key": _claim_state_key(kind), "date": date, "ttl": ttl}
+            )
+            row = await cur.fetchone()
+        return row is not None
+
     # -------------------------------------------------------- vector search
     async def similar_items(
         self, embedding: list[float], *, k: int = 20, since: datetime | None = None
@@ -528,6 +612,14 @@ class Repo:
 # --------------------------------------------------------------------------- #
 # Module-level helpers
 # --------------------------------------------------------------------------- #
+
+
+def _delivery_state_key(kind: DigestKind) -> str:
+    return f"delivery_{kind.value}"
+
+
+def _claim_state_key(kind: DigestKind) -> str:
+    return f"claim_{kind.value}"
 
 
 def _vec(embedding: list[float] | None) -> Any:

@@ -145,6 +145,50 @@ class FakeRepo:
     async def get_profile_override(self) -> dict | None:
         return self.state.get("profile_override")
 
+    # --- delivery / claim bookkeeping (catch-up) ---
+    async def record_delivery(
+        self, kind: DigestKind, date: str, *, email: bool, telegram: bool, delivered: bool
+    ) -> None:
+        await self.save_app_state(
+            f"delivery_{kind.value}",
+            {
+                "date": date,
+                "at": datetime.now(UTC).isoformat(),
+                "email": email,
+                "telegram": telegram,
+                "delivered": delivered,
+            },
+        )
+
+    async def get_delivery(self, kind: DigestKind) -> dict | None:
+        return await self.get_app_state(f"delivery_{kind.value}")
+
+    async def claim_digest_run(self, kind: DigestKind, date: str) -> None:
+        await self.save_app_state(
+            f"claim_{kind.value}", {"date": date, "at": datetime.now(UTC).isoformat()}
+        )
+
+    async def get_claim(self, kind: DigestKind) -> dict | None:
+        return await self.get_app_state(f"claim_{kind.value}")
+
+    async def try_claim_digest_run(self, kind: DigestKind, date: str, *, ttl: timedelta) -> bool:
+        """In-memory stand-in for Repo.try_claim_digest_run's atomic CAS.
+
+        This fake is single-threaded (no concurrent coroutines actually race on
+        it), so it models the SQL's outcome rather than its atomicity: return
+        False iff a FRESH (younger than ttl) claim for the SAME date already
+        exists; otherwise take the claim (no row / different date / stale all
+        win) and return True.
+        """
+        existing = await self.get_claim(kind)
+        if existing is not None and existing.get("date") == date:
+            at_raw = existing.get("at")
+            at = datetime.fromisoformat(at_raw) if isinstance(at_raw, str) else None
+            if at is not None and datetime.now(UTC) - at < ttl:
+                return False
+        await self.claim_digest_run(kind, date)
+        return True
+
 
 @pytest.fixture
 def wired(monkeypatch: pytest.MonkeyPatch) -> FakeRepo:
@@ -303,7 +347,7 @@ async def test_deliver_weekly_sends_full_rendered_markdown_as_email_text(
     monkeypatch.setattr(pipeline, "send_email", _fake_send_email)
     monkeypatch.setattr(pipeline, "get_settings", lambda: hermetic_settings)
 
-    await pipeline._deliver_weekly(sample_weekly)
+    await pipeline._deliver_weekly(sample_weekly, repo=FakeRepo())  # type: ignore[arg-type]
 
     text = captured.get("text")
     assert isinstance(text, str) and text

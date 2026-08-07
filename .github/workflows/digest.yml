@@ -8,6 +8,9 @@ name: Digest Pipeline
 #   RESEND_API_KEY, DIGEST_FROM_EMAIL, DIGEST_TO_EMAIL
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 #   S2_API_KEY, REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET
+#
+# TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID also gate the alert-on-failure job below,
+# which pages when the pipeline job fails OR is cancelled (see that job's comment).
 
 on:
   schedule:
@@ -16,18 +19,32 @@ on:
     - cron: "0 14 * * *" # daily — 14:00 UTC ≈ 07:00 America/Los_Angeles (PDT)
     - cron: "0 15 * * 0" # weekly — Sunday 15:00 UTC ≈ 08:00 PDT
     - cron: "0 11 * * *" # nightly recompute — 11:00 UTC ≈ 04:00 PDT
+    # Catch-up slots (see the 2026-08-06 incident: GitHub Actions runs 31118610124
+    # and 31120872463 both failed with "job was not acquired by Runner of type
+    # hosted" — the job never started, so no daily digest ran and nothing noticed).
+    # These re-run the primary job's script with --if-missing, which is a no-op
+    # the moment that day's/week's digest has already shipped.
+    - cron: "0 17 * * *" # daily catch-up #1 — +3h after the 14:00 daily slot
+    - cron: "0 20 * * *" # daily catch-up #2 — +6h after the 14:00 daily slot
+    - cron: "0 18 * * 0" # weekly catch-up — Sunday +3h after the 15:00 weekly slot
   workflow_dispatch:
     inputs:
       job:
         description: "Pipeline job to run"
         required: true
         type: choice
-        options: [ingest, daily, weekly, nightly]
+        options: [ingest, daily, weekly, nightly, daily-catchup, weekly-catchup]
 
 jobs:
   pipeline:
     name: Run pipeline job
     runs-on: ubuntu-latest
+    # A hung run must not block the next scheduled slot (ingest is every 3h)
+    # indefinitely; bound it well above the pipeline's normal runtime. The
+    # weekly editorial (best-of-N + polish) is the heaviest generation in the
+    # system and a daily run alone already takes ~5-6 minutes, so 45 still
+    # bounds a hung run well under GitHub's 6h default.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: backend
@@ -63,14 +80,79 @@ jobs:
         if: github.event.schedule == '0 */3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'ingest')
         run: python -m scripts.ingest
 
+      # Daily digest — the primary 14:00 slot and the two catch-up slots (+3h/+6h;
+      # 2026-08-06 incident: runs 31118610124 / 31120872463 failed with "job was
+      # not acquired by Runner", so the digest never ran) share ONE gated step.
+      # This is deliberate, not incidental: GitHub delays scheduled runs by
+      # ~1-2.5h routinely (the 14:00 slot has started as late as 16:11 UTC on
+      # this repo), so a delay past 3h would let the 17:00 catch-up fire BEFORE
+      # the delayed primary. Without a gate on the primary too, the delayed
+      # primary would then generate + deliver a SECOND time — a duplicate
+      # digest email, not just a duplicate no-op. --if-missing makes every one
+      # of these three triggers a no-op the moment the day's digest has already
+      # shipped, regardless of which one runs first.
       - name: Daily digest
-        if: github.event.schedule == '0 14 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'daily')
+        if: >-
+          github.event.schedule == '0 14 * * *' || github.event.schedule == '0 17 * * *' ||
+          github.event.schedule == '0 20 * * *' ||
+          (github.event_name == 'workflow_dispatch' && inputs.job == 'daily-catchup')
+        run: python -m scripts.run_daily --deliver --if-missing
+
+      # Manual force/override path ONLY — deliberately ungated (no --if-missing),
+      # for when you explicitly want to regenerate and re-send even though a
+      # digest already shipped for today. Never fires on a schedule.
+      - name: Daily digest (force)
+        if: github.event_name == 'workflow_dispatch' && inputs.job == 'daily'
         run: python -m scripts.run_daily --deliver
 
+      # Weekly digest — same reasoning as the daily step above: the primary
+      # Sunday 15:00 slot and the Sunday 18:00 catch-up share one gated step.
       - name: Weekly digest
-        if: github.event.schedule == '0 15 * * 0' || (github.event_name == 'workflow_dispatch' && inputs.job == 'weekly')
+        if: >-
+          github.event.schedule == '0 15 * * 0' || github.event.schedule == '0 18 * * 0' ||
+          (github.event_name == 'workflow_dispatch' && inputs.job == 'weekly-catchup')
+        run: python -m scripts.run_weekly --deliver --if-missing
+
+      # Manual force/override path ONLY — see "Daily digest (force)" above.
+      - name: Weekly digest (force)
+        if: github.event_name == 'workflow_dispatch' && inputs.job == 'weekly'
         run: python -m scripts.run_weekly --deliver
 
       - name: Nightly recompute
         if: github.event.schedule == '0 11 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'nightly')
         run: python -m scripts.run_nightly
+
+  alert-on-failure:
+    name: Alert on pipeline failure
+    needs: pipeline
+    # MUST fire on cancellation too, not just failure: the 2026-08-06 incident's
+    # runs had conclusion "cancelled" (GitHub couldn't acquire a hosted runner),
+    # not "failure" — a bare `if: failure()` would have missed exactly this. This
+    # job normally wouldn't even be considered once `pipeline` fails, so always()
+    # forces it to run and the boolean condition then filters to the bad outcomes.
+    if: always() && (needs.pipeline.result == 'failure' || needs.pipeline.result == 'cancelled')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RESULT: ${{ needs.pipeline.result }}
+        run: |
+          # Quietly no-op when Telegram isn't configured — this alert is best-effort,
+          # never a reason to fail the workflow.
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            exit 0
+          fi
+          # --silent --output /dev/null: no progress meter, no response body. NO
+          # --show-error: curl's error text can itself echo the request URL (which
+          # carries the bot token) — Actions masks known secret values in logs, but
+          # this must not rely on that alone. On failure, print a message with NO
+          # url and NO token at all.
+          curl --silent --output /dev/null \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${WORKFLOW_NAME} ${RESULT}: ${RUN_URL}" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            || echo "telegram alert failed"
