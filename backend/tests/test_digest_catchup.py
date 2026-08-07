@@ -62,17 +62,20 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> FakeRepo:
 # scope here (see tests/test_repo_attach_items.py / test_repo_connect_retry.py
 # for the house style of stubbing at that boundary rather than hitting a DB).
 #
-# Repo.try_claim_digest_run is NOT covered here for the same reason, but more
-# so: it is a single hand-written compare-and-set SQL statement (INSERT ...
-# ON CONFLICT DO UPDATE ... WHERE <stale-or-different-date> RETURNING key)
-# whose atomicity IS the point — a Python-side stub of save_app_state/
-# get_app_state cannot exercise that statement at all (it bypasses them
-# entirely and talks to the connection directly), and a fake that reimplements
-# the same WHERE-clause logic in Python would only prove itself, not the SQL.
-# The pipeline-level race regression below (test_two_sequential_run_daily_
-# if_missing_calls_produce_exactly_one_run) covers the CALL PATTERN (_catch_up
-# must gate on try_claim_digest_run's return value); the SQL itself needs
-# review by eye and, ideally, a smoke test against a real Postgres before ship.
+# Repo.try_claim_digest_run and Repo.claim_digest_run are NOT covered here for
+# the same reason, but more so: both are hand-written raw SQL (INSERT ... ON
+# CONFLICT DO UPDATE ..., the former additionally gated by a WHERE clause and
+# RETURNING key) that stamps `at` with Postgres `now()` — deliberately bypassing
+# save_app_state/get_app_state entirely so the write and the staleness reads
+# share exactly one clock. A Python-side stub of save_app_state/get_app_state
+# cannot exercise either statement at all, and a fake that reimplements the SQL
+# in Python would only prove itself, not the SQL. The pipeline-level race
+# regression below (test_two_concurrent_catchups_run_the_digest_exactly_once)
+# covers the CALL PATTERN (_catch_up must gate on try_claim_digest_run's return
+# value); the SQL itself needs review by eye and, ideally, a smoke test against
+# a real Postgres before ship. get_claim's own logic (key naming + read-through
+# to get_app_state) is still covered below by seeding the stub directly rather
+# than going through claim_digest_run.
 
 
 class _AppStateStub:
@@ -116,11 +119,20 @@ async def test_record_delivery_and_get_delivery_round_trip() -> None:
 
 
 @pytest.mark.asyncio
-async def test_claim_digest_run_and_get_claim_round_trip() -> None:
-    repo = _repo_with_stubbed_app_state()
+async def test_get_claim_reads_through_by_kind_key() -> None:
+    """get_claim's own logic: reads through to get_app_state under the correct
+    per-kind key, and does not bleed across kinds. Seeds the stub's store
+    directly (rather than via claim_digest_run, which is raw SQL — see the
+    comment block above) since only get_claim's read-through is testable here.
+    """
+    repo = Repo(dsn="postgresql://u:p@h/db")
+    stub = _AppStateStub()
+    repo.save_app_state = stub.save_app_state  # type: ignore[method-assign]
+    repo.get_app_state = stub.get_app_state  # type: ignore[method-assign]
+
     assert await repo.get_claim(DigestKind.WEEKLY) is None
 
-    await repo.claim_digest_run(DigestKind.WEEKLY, WEEK_OF)
+    stub.store[f"claim_{DigestKind.WEEKLY.value}"] = {"date": WEEK_OF, "at": "2026-06-15T00:00:00+00:00"}
 
     claim = await repo.get_claim(DigestKind.WEEKLY)
     assert claim is not None
@@ -174,7 +186,9 @@ async def test_run_daily_if_missing_proceeds_when_digest_exists_but_not_delivere
 
     called: dict[str, object] = {}
 
-    async def _fake_run_daily(*, date: str | None = None, deliver: bool = False) -> DailyDigest:
+    async def _fake_run_daily(
+        *, date: str | None = None, deliver: bool = False, **_kwargs: object
+    ) -> DailyDigest:
         called["date"] = date
         called["deliver"] = deliver
         return busy_daily
@@ -198,7 +212,9 @@ async def test_run_daily_if_missing_proceeds_when_delivery_recorded_for_a_differ
 
     called = {"n": 0}
 
-    async def _fake_run_daily(*, date: str | None = None, deliver: bool = False) -> DailyDigest:
+    async def _fake_run_daily(
+        *, date: str | None = None, deliver: bool = False, **_kwargs: object
+    ) -> DailyDigest:
         called["n"] += 1
         return busy_daily
 
@@ -217,7 +233,9 @@ async def test_run_daily_if_missing_proceeds_when_nothing_exists(
     """The incident case: no digest, no delivery record, no claim at all."""
     called = {"n": 0}
 
-    async def _fake_run_daily(*, date: str | None = None, deliver: bool = False) -> DailyDigest:
+    async def _fake_run_daily(
+        *, date: str | None = None, deliver: bool = False, **_kwargs: object
+    ) -> DailyDigest:
         called["n"] += 1
         return busy_daily
 
@@ -230,6 +248,47 @@ async def test_run_daily_if_missing_proceeds_when_nothing_exists(
 
 
 @pytest.mark.asyncio
+async def test_run_daily_if_missing_regenerates_when_stored_digest_type_mismatches_kind(
+    wired: FakeRepo,
+    sample_weekly: WeeklyDigest,
+    busy_daily: DailyDigest,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Defends the isinstance-guarded cast in `_catch_up`: if the object found
+    under `digest_id` is NOT the type `kind` expects (a data-integrity anomaly —
+    e.g. the digests table's `kind` column and its JSON content diverging), it
+    must NOT be silently returned to the caller. An unchecked cast would hand a
+    WeeklyDigest to code that expects a DailyDigest (e.g. render_daily_md),
+    crashing somewhere far less diagnosable than here. Instead: log loudly and
+    fall through to regenerate — the self-healing behavior this feature exists
+    for in the first place.
+    """
+    wired.dailies["daily-2026-06-21"] = sample_weekly  # type: ignore[assignment]
+
+    called = {"n": 0}
+
+    async def _fake_run_daily(
+        *, date: str | None = None, deliver: bool = False, **_kwargs: object
+    ) -> DailyDigest:
+        called["n"] += 1
+        return busy_daily
+
+    monkeypatch.setattr(pipeline, "run_daily", _fake_run_daily)
+
+    # deliver=False so "already done" turns on `stored is not None` alone (see
+    # _catch_up) — the branch that reaches the (now isinstance-guarded) cast.
+    with caplog.at_level(logging.ERROR, logger="aidigest.flows"):
+        result = await pipeline.run_daily_if_missing(date=DATE, deliver=False)
+
+    assert called["n"] == 1, "must regenerate rather than trust the mismatched stored object"
+    assert result is busy_daily
+    assert any(
+        r.levelname == "ERROR" and "type_mismatch" in r.message for r in caplog.records
+    ), "the type mismatch must be logged loudly, not silently swallowed"
+
+
+@pytest.mark.asyncio
 async def test_run_daily_if_missing_skips_with_none_when_claim_is_fresh(
     wired: FakeRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -237,7 +296,9 @@ async def test_run_daily_if_missing_skips_with_none_when_claim_is_fresh(
 
     called = {"n": 0}
 
-    async def _fake_run_daily(*, date: str | None = None, deliver: bool = False) -> DailyDigest:
+    async def _fake_run_daily(
+        *, date: str | None = None, deliver: bool = False, **_kwargs: object
+    ) -> DailyDigest:
         called["n"] += 1
         raise AssertionError("must not run while a fresh claim is in flight")
 
@@ -258,7 +319,9 @@ async def test_run_daily_if_missing_proceeds_when_claim_is_stale(
 
     called = {"n": 0}
 
-    async def _fake_run_daily(*, date: str | None = None, deliver: bool = False) -> DailyDigest:
+    async def _fake_run_daily(
+        *, date: str | None = None, deliver: bool = False, **_kwargs: object
+    ) -> DailyDigest:
         called["n"] += 1
         return busy_daily
 
@@ -326,7 +389,9 @@ async def test_two_concurrent_catchups_run_the_digest_exactly_once(
     """
     calls = {"n": 0}
 
-    async def _fake_run_daily(*, date: str | None = None, deliver: bool = False) -> DailyDigest:
+    async def _fake_run_daily(
+        *, date: str | None = None, deliver: bool = False, **_kwargs: object
+    ) -> DailyDigest:
         calls["n"] += 1
         await asyncio.sleep(0)  # yield control so the other gathered call can run
         return busy_daily
@@ -372,7 +437,7 @@ async def test_run_weekly_if_missing_proceeds_when_digest_exists_but_not_deliver
     called = {"n": 0}
 
     async def _fake_run_weekly(
-        *, week_of: str | None = None, deliver: bool = False
+        *, week_of: str | None = None, deliver: bool = False, **_kwargs: object
     ) -> WeeklyDigest:
         called["n"] += 1
         return sample_weekly
@@ -392,7 +457,7 @@ async def test_run_weekly_if_missing_proceeds_when_nothing_exists(
     called = {"n": 0}
 
     async def _fake_run_weekly(
-        *, week_of: str | None = None, deliver: bool = False
+        *, week_of: str | None = None, deliver: bool = False, **_kwargs: object
     ) -> WeeklyDigest:
         called["n"] += 1
         return sample_weekly
@@ -414,7 +479,7 @@ async def test_run_weekly_if_missing_skips_with_none_when_claim_is_fresh(
     called = {"n": 0}
 
     async def _fake_run_weekly(
-        *, week_of: str | None = None, deliver: bool = False
+        *, week_of: str | None = None, deliver: bool = False, **_kwargs: object
     ) -> WeeklyDigest:
         called["n"] += 1
         raise AssertionError("must not run while a fresh claim is in flight")
@@ -439,7 +504,7 @@ async def test_run_weekly_if_missing_proceeds_when_claim_is_stale(
     called = {"n": 0}
 
     async def _fake_run_weekly(
-        *, week_of: str | None = None, deliver: bool = False
+        *, week_of: str | None = None, deliver: bool = False, **_kwargs: object
     ) -> WeeklyDigest:
         called["n"] += 1
         return sample_weekly
@@ -485,7 +550,7 @@ async def test_two_concurrent_weekly_catchups_run_the_digest_exactly_once(
     calls = {"n": 0}
 
     async def _fake_run_weekly(
-        *, week_of: str | None = None, deliver: bool = False
+        *, week_of: str | None = None, deliver: bool = False, **_kwargs: object
     ) -> WeeklyDigest:
         calls["n"] += 1
         await asyncio.sleep(0)  # yield control so the other gathered call can run
@@ -545,6 +610,90 @@ async def test_run_daily_writes_a_claim_before_generating(
 
 
 @pytest.mark.asyncio
+async def test_run_daily_warns_when_overriding_a_fresh_in_flight_claim(
+    wired: FakeRepo, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The manual force path (`run_daily` called directly, unconditionally) must
+    stay unconditional — gating it would defeat the point of a force/override
+    escape hatch — but it must not be SILENT about clobbering a claim another
+    run may still be actively holding. A fresh claim for the SAME date logs a
+    WARNING; the run still proceeds (see the no-warning cases below for the
+    non-colliding claim states).
+    """
+    await wired.claim_digest_run(DigestKind.DAILY, DATE)
+
+    with caplog.at_level(logging.WARNING, logger="aidigest.flows"):
+        await pipeline.run_ingest()
+        digest = await pipeline.run_daily(date=DATE)
+
+    assert digest is not None  # force path still ran to completion
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any(
+        "in_flight" in r.message and DATE in r.message for r in warnings
+    ), f"expected an in-flight claim override warning, got: {[r.message for r in warnings]}"
+
+
+@pytest.mark.asyncio
+async def test_run_daily_does_not_warn_when_no_claim_exists(
+    wired: FakeRepo, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="aidigest.flows"):
+        await pipeline.run_ingest()
+        await pipeline.run_daily(date=DATE)
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+@pytest.mark.asyncio
+async def test_run_daily_does_not_warn_when_claim_is_stale(
+    wired: FakeRepo, caplog: pytest.LogCaptureFixture
+) -> None:
+    stale_at = (datetime.now(UTC) - pipeline._CLAIM_TTL - timedelta(minutes=1)).isoformat()
+    await wired.save_app_state(f"claim_{DigestKind.DAILY.value}", {"date": DATE, "at": stale_at})
+
+    with caplog.at_level(logging.WARNING, logger="aidigest.flows"):
+        await pipeline.run_ingest()
+        await pipeline.run_daily(date=DATE)
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+@pytest.mark.asyncio
+async def test_run_daily_does_not_warn_when_claim_is_for_a_different_date(
+    wired: FakeRepo, caplog: pytest.LogCaptureFixture
+) -> None:
+    await wired.claim_digest_run(DigestKind.DAILY, "2026-06-20")
+
+    with caplog.at_level(logging.WARNING, logger="aidigest.flows"):
+        await pipeline.run_ingest()
+        await pipeline.run_daily(date=DATE)
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+@pytest.mark.asyncio
+async def test_run_daily_if_missing_does_not_warn_about_its_own_just_won_claim(
+    wired: FakeRepo, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`_catch_up` atomically wins the claim via `try_claim_digest_run`, then
+    calls the real `run_daily`, which immediately re-reads the SAME claim it
+    (transitively) just won a moment earlier. That must NOT be reported as an
+    override of another run's in-flight claim — it is this exact call chain
+    refreshing its own claim, not a collision. If the in-flight-claim warning
+    fired here, EVERY successful catch-up run would log a false "may double-
+    deliver" alarm, which is worse than no warning at all.
+    """
+    with caplog.at_level(logging.WARNING, logger="aidigest.flows"):
+        await pipeline.run_ingest()
+        digest = await pipeline.run_daily_if_missing(date=DATE, deliver=False)
+
+    assert digest is not None
+    assert not [
+        r for r in caplog.records if r.levelname == "WARNING"
+    ], "run_daily_if_missing must never warn about the claim it just atomically won"
+
+
+@pytest.mark.asyncio
 async def test_run_daily_records_delivery_after_delivering_both_channels_ok(
     wired: FakeRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -570,6 +719,47 @@ async def test_run_daily_records_delivery_after_delivering_both_channels_ok(
     assert delivery["email"] is True
     assert delivery["telegram"] is True
     assert delivery["delivered"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_daily_records_delivery_before_wiki_export(
+    wired: FakeRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard for the crash-window shrink: record_delivery must run
+    BEFORE the wiki export, not after — wiki export is unrelated filesystem work
+    that only widens the window in which a crash could lose a successful send's
+    delivery record (see _delivery_matches for why that lost-record case is an
+    accepted at-least-once tradeoff, not a reason to widen the window further).
+    """
+    settings_with_wiki = _settings_with_channels(email=True, telegram=True).model_copy(
+        update={"wiki_dir": "/tmp/unused-wiki-dir-for-this-test"}
+    )
+    monkeypatch.setattr(pipeline, "get_settings", lambda: settings_with_wiki)
+
+    async def _fake_send_email(*, subject: str, html: str, text: str | None = None) -> bool:
+        return True
+
+    async def _fake_tg_send_daily(digest: DailyDigest) -> bool:
+        return True
+
+    seen: dict[str, object] = {}
+
+    def _spy_wiki_export_daily(digest: DailyDigest, *, wiki_dir: str) -> list:
+        seen["called"] = True
+        seen["delivery_at_wiki_time"] = wired.state.get(f"delivery_{DigestKind.DAILY.value}")
+        return []
+
+    monkeypatch.setattr(pipeline, "send_email", _fake_send_email)
+    monkeypatch.setattr(pipeline, "tg_send_daily", _fake_tg_send_daily)
+    monkeypatch.setattr(pipeline, "wiki_export_daily", _spy_wiki_export_daily)
+
+    await pipeline.run_ingest()
+    await pipeline.run_daily(date=DATE, deliver=True)
+
+    assert seen.get("called") is True, "the wiki export spy never ran"
+    assert seen.get("delivery_at_wiki_time") is not None, (
+        "record_delivery must be awaited before wiki export runs"
+    )
 
 
 @pytest.mark.asyncio
@@ -655,6 +845,68 @@ async def test_run_weekly_writes_a_claim_before_generating(
 
 
 @pytest.mark.asyncio
+async def test_run_weekly_warns_when_overriding_a_fresh_in_flight_claim(
+    wired: FakeRepo, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Weekly counterpart of test_run_daily_warns_when_overriding_a_fresh_in_flight_claim."""
+    await wired.claim_digest_run(DigestKind.WEEKLY, WEEK_OF)
+
+    with caplog.at_level(logging.WARNING, logger="aidigest.flows"):
+        await pipeline.run_ingest()
+        await pipeline.run_process()
+        digest = await pipeline.run_weekly(week_of=WEEK_OF)
+
+    assert digest is not None
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any(
+        "in_flight" in r.message and WEEK_OF in r.message for r in warnings
+    ), f"expected an in-flight claim override warning, got: {[r.message for r in warnings]}"
+
+
+@pytest.mark.asyncio
+async def test_run_weekly_does_not_warn_when_no_claim_exists(
+    wired: FakeRepo, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="aidigest.flows"):
+        await pipeline.run_ingest()
+        await pipeline.run_process()
+        await pipeline.run_weekly(week_of=WEEK_OF)
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+@pytest.mark.asyncio
+async def test_run_weekly_does_not_warn_when_claim_is_stale(
+    wired: FakeRepo, caplog: pytest.LogCaptureFixture
+) -> None:
+    stale_at = (datetime.now(UTC) - pipeline._CLAIM_TTL - timedelta(minutes=1)).isoformat()
+    await wired.save_app_state(
+        f"claim_{DigestKind.WEEKLY.value}", {"date": WEEK_OF, "at": stale_at}
+    )
+
+    with caplog.at_level(logging.WARNING, logger="aidigest.flows"):
+        await pipeline.run_ingest()
+        await pipeline.run_process()
+        await pipeline.run_weekly(week_of=WEEK_OF)
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+@pytest.mark.asyncio
+async def test_run_weekly_does_not_warn_when_claim_is_for_a_different_date(
+    wired: FakeRepo, caplog: pytest.LogCaptureFixture
+) -> None:
+    await wired.claim_digest_run(DigestKind.WEEKLY, "2026-06-08")
+
+    with caplog.at_level(logging.WARNING, logger="aidigest.flows"):
+        await pipeline.run_ingest()
+        await pipeline.run_process()
+        await pipeline.run_weekly(week_of=WEEK_OF)
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+@pytest.mark.asyncio
 async def test_run_weekly_records_delivery_flags_email_only(
     wired: FakeRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -677,6 +929,42 @@ async def test_run_weekly_records_delivery_flags_email_only(
     assert delivery["email"] is True
     assert delivery["telegram"] is False
     assert delivery["delivered"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_weekly_records_delivery_before_wiki_export(
+    wired: FakeRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Weekly counterpart of test_run_daily_records_delivery_before_wiki_export
+    above — see that test's docstring for the crash-window rationale."""
+    settings_with_wiki = _settings_with_channels(email=True, telegram=False).model_copy(
+        update={"wiki_dir": "/tmp/unused-wiki-dir-for-this-test"}
+    )
+    monkeypatch.setattr(pipeline, "get_settings", lambda: settings_with_wiki)
+
+    async def _fake_send_email(*, subject: str, html: str, text: str | None = None) -> bool:
+        return True
+
+    seen: dict[str, object] = {}
+
+    def _spy_wiki_export_weekly(
+        digest: WeeklyDigest, *, wiki_dir: str, daily_dates: list[str] | None = None
+    ) -> list:
+        seen["called"] = True
+        seen["delivery_at_wiki_time"] = wired.state.get(f"delivery_{DigestKind.WEEKLY.value}")
+        return []
+
+    monkeypatch.setattr(pipeline, "send_email", _fake_send_email)
+    monkeypatch.setattr(pipeline, "wiki_export_weekly", _spy_wiki_export_weekly)
+
+    await pipeline.run_ingest()
+    await pipeline.run_process()
+    await pipeline.run_weekly(week_of=WEEK_OF, deliver=True)
+
+    assert seen.get("called") is True, "the wiki export spy never ran"
+    assert seen.get("delivery_at_wiki_time") is not None, (
+        "record_delivery must be awaited before wiki export runs"
+    )
 
 
 @pytest.mark.asyncio
@@ -909,3 +1197,24 @@ def test_workflow_scheduled_daily_and_weekly_steps_use_if_missing_but_force_step
         assert "github.event.schedule" not in step.get(
             "if", ""
         ), f"{name!r} is a manual-only force path and must never fire on a schedule"
+
+
+def test_claim_ttl_exceeds_the_pipeline_job_timeout() -> None:
+    """The invariant: `_CLAIM_TTL` must be strictly greater than the workflow
+    pipeline job's `timeout-minutes`.
+
+    GitHub hard-kills a run at `timeout-minutes`, so a claim older than that
+    CANNOT belong to a still-live run — TTL <= timeout would let a legitimately
+    slow (but healthy) run's claim go stale WHILE the run is still executing, so
+    a catch-up would see "stale", win the CAS, and generate + deliver a second
+    time underneath the still-running original. Parses timeout-minutes out of
+    digest.yml directly so whoever changes either number independently gets a
+    failing test instead of a silent double-send.
+    """
+    doc = yaml.safe_load(_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    timeout_minutes = doc["jobs"]["pipeline"]["timeout-minutes"]
+    assert pipeline._CLAIM_TTL > timedelta(minutes=timeout_minutes), (
+        f"_CLAIM_TTL ({pipeline._CLAIM_TTL}) must exceed the pipeline job's "
+        f"timeout-minutes ({timeout_minutes}) or a slow-but-healthy run's own "
+        "claim can go stale while it is still executing"
+    )

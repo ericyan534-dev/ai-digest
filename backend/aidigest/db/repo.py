@@ -530,10 +530,25 @@ class Repo:
         For deciding whether to START a run in the first place, use
         `try_claim_digest_run` instead — this method is a plain overwrite, not a
         compare-and-set, so two callers racing here would both "win".
+
+        `at` is stamped server-side with Postgres `now()` (raw SQL, not
+        `save_app_state`) — deliberately the SAME clock `try_claim_digest_run`
+        writes and every staleness check (`(value ->> 'at')::timestamptz < now()
+        - ttl`) reads. If this used the runner's Python clock instead, a claim's
+        `at` could be ahead of or behind the clock the CAS statement compares it
+        against, purely from clock skew between two different runners — exactly
+        the class of bug `try_claim_digest_run` exists to eliminate on the write
+        it controls; this method must not reintroduce it on the write it owns.
         """
-        await self.save_app_state(
-            _claim_state_key(kind), {"date": date, "at": datetime.now(UTC).isoformat()}
-        )
+        sql = """
+            INSERT INTO app_state (key, value, updated_at)
+            VALUES (%(key)s, jsonb_build_object('date', %(date)s::text, 'at', now()), now())
+            ON CONFLICT (key) DO UPDATE SET
+                value = jsonb_build_object('date', %(date)s::text, 'at', now()),
+                updated_at = now()
+        """
+        async with self._require_pool().connection() as conn:
+            await conn.execute(sql, {"key": _claim_state_key(kind), "date": date})
 
     async def get_claim(self, kind: DigestKind) -> dict | None:
         return await self.get_app_state(_claim_state_key(kind))
