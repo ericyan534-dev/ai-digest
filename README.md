@@ -13,7 +13,6 @@ pipeline into a **short daily digest** and a **long weekly "Week at a Glance"**
 editorial, serves them in an interactive web app (+ email + Telegram), and
 **learns from your 👍/👎 feedback**.
 
-Full design rationale: [`AI_DIGEST_WIKI.md`](./AI_DIGEST_WIKI.md).
 
 **Reviewing this without an API key?** The entire pipeline runs in a deterministic
 mock-LLM mode — no credentials, no network calls, reproducible output:
