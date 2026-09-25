@@ -5,7 +5,6 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/)
 
-> *A smol.ai for an audience of one — that also reads arXiv.*
 
 A self-hosted, single-user, **LLM-powered personal AI-news engine**. It ingests
 community + industry + **academia** sources, compresses them with a Gemini
