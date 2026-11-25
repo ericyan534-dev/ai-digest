@@ -14,7 +14,7 @@ editorial, serves them in an interactive web app (+ email + Telegram), and
 
 
 **Reviewing this without an API key?** The entire pipeline runs in a deterministic
-mock-LLM mode — no credentials, no network calls, reproducible output:
+mock-LLM mode:
 
 ```bash
 AIDIGEST_LLM_MOCK=1 make daily   # generate a digest offline
